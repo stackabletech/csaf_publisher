@@ -1,5 +1,6 @@
 [package]
 name = "csaf_transformer"
+description = "Tool to apply Stackable specific customizations to CSAF documents"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +8,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
+color-eyre = "0.6.3"
 csaf = "0.5.0"
 regex = "1.10.4"
 serde_json = "1.0.117"
-tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread"] }
