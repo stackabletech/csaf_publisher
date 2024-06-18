@@ -1,5 +1,12 @@
+use color_eyre::eyre::Context;
+use pgp::ArmorOptions;
+use pgp::{Deserializable, Message, SignedSecretKey};
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fs;
+use std::io::{Read, Write};
 
+use chrono::Datelike;
 use color_eyre::eyre::{ContextCompat, Result};
 use csaf::{
     definitions::{Branch, BranchCategory, BranchesT},
@@ -11,11 +18,47 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let stackable_product_version_regex: Regex = Regex::new(r"^(?P<productname>[a-zA-Z0-9\-_]+):(?P<prefix>(?P<productversion>.+)\-stackable)?(?P<sdpversion>\d+\.\d+\.\d+(\-dev)?(\-(?P<architecture>arm64|amd64))?)$").unwrap();
 
-    let input_file = env::args().nth(1).context("Missing input file!\nUsage: csaf_transformer <input-file> <output-file>")?;
-    let output_file = env::args().nth(2).context("Missing output file!\nUsage: csaf_transformer <input-file> <output-file>")?;
+    let secobserve_api_token =
+        env::var("SECOBSERVE_API_TOKEN").context("Missing SecObserve API token!")?;
 
-    let file = &std::fs::read_to_string(input_file)?;
-    let mut csaf: Csaf = serde_json::from_str(file)?;
+    let vulnerability_names = env::args().skip(1).collect::<Vec<String>>();
+
+    let response = reqwest::blocking::ClientBuilder::new()
+        .build()?
+        .post("https://secobserve-backend.stackable.tech/api/vex/csaf_document/create/")
+        .json(
+            &serde_json::json!({
+                    "vulnerability_names": &vulnerability_names,
+                    "document_id_prefix": "STACKSA",
+                    "title": format!("Stackable Security Advisory for: {}", vulnerability_names.join(", ")),
+                    "publisher_name": "Stackable GmbH",
+                    "publisher_category": "vendor",
+                    "publisher_namespace": "http://www.stackable.tech",
+                    "tracking_status": "final",
+                    "tlp_label": "WHITE"
+            }),
+        )
+        .header(
+            "Authorization",
+            format!("APIToken {}", secobserve_api_token),
+        )
+        .header(
+            "User-Agent",
+            "Stackable Security Advisory Generator",
+        )
+        .send()?;
+
+    let headers = response.headers();
+    let filename = headers
+        .get("Content-Disposition")
+        .context("missing Content-Disposition header")?
+        .to_str()?
+        .split("filename=")
+        .last()
+        .context("missing filename in Content-Disposition header")?
+        .replace('"', "");
+
+    let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
     csaf.document.lang = Some("en".to_string());
     let mut branches = csaf
         .product_tree
@@ -73,27 +116,40 @@ fn main() -> Result<()> {
                                         idx
                                     });
 
-
                                 // find product_name branch in sdp_branches or create it
                                 let product_name = captures.name("productname").unwrap().as_str();
 
-                                let product_name_idx = sdp_branches[sdp_version_idx].branches.as_mut().unwrap().0
+                                let product_name_idx = sdp_branches[sdp_version_idx]
+                                    .branches
+                                    .as_mut()
+                                    .unwrap()
+                                    .0
                                     .iter()
                                     .position(|b| b.name == product_name)
                                     .unwrap_or_else(|| {
-                                        let idx = sdp_branches[sdp_version_idx].branches.as_ref().unwrap().0.len();
-                                        sdp_branches[sdp_version_idx].branches.as_mut().unwrap().0.push(Branch {
-                                            name: product_name.to_string(),
-                                            category: BranchCategory::ProductName,
-                                            product: None,
-                                            branches: Some(BranchesT(vec![])),
-                                        });
+                                        let idx = sdp_branches[sdp_version_idx]
+                                            .branches
+                                            .as_ref()
+                                            .unwrap()
+                                            .0
+                                            .len();
+                                        sdp_branches[sdp_version_idx]
+                                            .branches
+                                            .as_mut()
+                                            .unwrap()
+                                            .0
+                                            .push(Branch {
+                                                name: product_name.to_string(),
+                                                category: BranchCategory::ProductName,
+                                                product: None,
+                                                branches: Some(BranchesT(vec![])),
+                                            });
                                         idx
                                     });
 
                                 // append product version branch to product_name branch
-                                sdp_branches[sdp_version_idx].branches.as_mut()
-                                .unwrap().0[product_name_idx]
+                                sdp_branches[sdp_version_idx].branches.as_mut().unwrap().0
+                                    [product_name_idx]
                                     .branches
                                     .as_mut()
                                     .unwrap()
@@ -122,7 +178,78 @@ fn main() -> Result<()> {
 
     csaf.product_tree.as_mut().unwrap().branches = Some(BranchesT(new_branches));
 
-    std::fs::write(output_file, serde_json::to_string_pretty(&csaf)?)?;
+    let current_year = chrono::Local::now().year().to_string();
+    std::fs::create_dir_all(&current_year)?;
+
+    // write csaf to file
+    let csaf_as_string = serde_json::to_string_pretty(&csaf)?;
+    let csaf_filename = format!("{}/{}", current_year, filename);
+    std::fs::write(&csaf_filename, &csaf_as_string)?;
+
+    // generate PGP signature
+    let key_string = env::var("PGP_SECRET_KEY").context("Missing PGP secret key!")?;
+    let (secret_key, _headers) = SignedSecretKey::from_string(&key_string).unwrap();
+    let mut signature_filehandle = fs::File::create(format!("{}/{}.asc", current_year, filename))?;
+    let mut pgp_message = Message::new_literal(csaf_filename.as_bytes(), &csaf_as_string);
+    pgp_message = pgp_message.sign(
+        &secret_key,
+        || env::var("PGP_SECRET_KEY_PASSPHRASE").expect("Missing PGP secret key passphrase!"),
+        pgp::crypto::hash::HashAlgorithm::SHA2_256,
+    )?;
+    pgp_message
+        .into_signature()
+        .to_armored_writer(&mut signature_filehandle, ArmorOptions::default())?;
+
+    let mut file = fs::File::open(&csaf_filename)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+
+    // generate sha256 hash
+    let mut hasher = Sha256::new();
+    hasher.update(&buffer);
+    let result = hasher.finalize();
+    let hash = format!("{:x}", result);
+
+    // write hash to file
+    let hash_filename = format!("{}/{}.sha256", current_year, filename);
+    fs::write(hash_filename, hash)?;
+
+
+    // generate an index.html file listing all the files in the current_year directory
+    let mut index_file = fs::File::create(format!("{}/index.html", current_year))?;
+    let mut index_content = String::new();
+    index_content.push_str("<html><head><title>Stackable Security Advisories</title></head><body><h1>Stackable Security Advisories</h1><ul>");
+
+    // collect entries into a vec and sort them alphabetically
+    let mut entries: Vec<_> = fs::read_dir(&current_year)?.map(|entry| entry.unwrap()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let entry_name = entry.file_name().into_string().unwrap();
+        if entry_name != "index.html" {
+            index_content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", entry_name, entry_name));
+        }
+    }
+
+    index_content.push_str("</ul></body></html>");
+    index_file.write_all(index_content.as_bytes())?;
+
+    // generate an index.html file listing all the files in the current directory
+    let mut index_file = fs::File::create("index.html")?;
+    let mut index_content = String::new();
+    index_content.push_str("<html><head><title>Stackable Security Advisories</title></head><body><h1>Stackable Security Advisories</h1><ul>");
+
+    // collect entries into a vec and sort them alphabetically
+    let mut entries: Vec<_> = fs::read_dir(".")?.map(|entry| entry.unwrap()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let entry_name = entry.file_name().into_string().unwrap();
+        if entry_name != "index.html" {
+            index_content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", entry_name, entry_name));
+        }
+    }
+
+    index_content.push_str("</ul></body></html>");
+    index_file.write_all(index_content.as_bytes())?;
 
     Ok(())
 }

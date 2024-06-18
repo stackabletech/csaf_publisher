@@ -1,6 +1,6 @@
 [package]
-name = "csaf_transformer"
-description = "Tool to apply Stackable specific customizations to CSAF documents"
+name = "csaf_publisher"
+description = "Tool to apply Stackable specific customizations to CSAF documents and store them in a directory structure, so they can be published in a Git repository."
 version = "0.1.0"
 edition = "2021"
 
@@ -8,7 +8,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
+chrono = "0.4.38"
 color-eyre = "0.6.3"
 csaf = "0.5.0"
+pgp = "0.13.0"
 regex = "1.10.4"
+reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_json = "1.0.117"
+sha2 = "0.10.8"
