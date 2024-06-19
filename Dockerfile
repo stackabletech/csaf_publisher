@@ -7,15 +7,10 @@ ARG VERSION
 ARG RELEASE="1"
 
 # Update image
-RUN microdnf update -y && microdnf clean all && \
-    groupadd --gid 1000 --system stackable && \
-    useradd --gid stackable --uid 1000 --system stackable -d /stackable && \
-    mkdir /stackable && \
-    chown stackable:stackable /stackable
+RUN microdnf update -y && microdnf clean all && mkdir /stackable
 
 COPY --from=builder /app/csaf_publisher  /
 
 WORKDIR /stackable
-USER stackable
 
 ENTRYPOINT ["/csaf_publisher"]

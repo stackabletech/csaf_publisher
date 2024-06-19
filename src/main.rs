@@ -240,6 +240,7 @@ fn main() -> Result<()> {
         .write(true)
         .truncate(true)
         .open("index.txt")?;
+    index_file.write_all(contents.as_bytes())?;
 
     // generate an index.html file listing all the files in the current_year directory
     let mut index_file = fs::File::create(format!("{}/index.html", current_year))?;
