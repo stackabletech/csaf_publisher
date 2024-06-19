@@ -3,7 +3,7 @@ use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
 use sha2::{Digest, Sha512};
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 
 use chrono::Datelike;
@@ -215,58 +215,33 @@ fn main() -> Result<()> {
     fs::write(hash_filename, hash)?;
 
     // prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
-    let mut changes_file = fs::OpenOptions::new()
-        .read(true)
-        .open("changes.csv")?;
-    let mut contents = String::new();
-    changes_file.read_to_string(&mut contents)?;
-    let changes_line = format!("{},\"{}\"\n", csaf_filename, chrono::Utc::now());
-    contents = changes_line + &contents;
-    changes_file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open("changes.csv")?;
-    changes_file.write_all(contents.as_bytes())?;
-
+    prepend_to_file("changes.csv", &format!("{},\"{}\"\n", csaf_filename, chrono::Utc::now()))?;
     // prepend the filename to index.txt
-    let mut index_file = fs::OpenOptions::new()
-        .read(true)
-        .open("index.txt")?;
-    let mut contents = String::new();
-    index_file.read_to_string(&mut contents)?;
-    let index_line = format!("{}\n", csaf_filename);
-    contents = index_line + &contents;
-    index_file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open("index.txt")?;
-    index_file.write_all(contents.as_bytes())?;
+    prepend_to_file("index.txt", &format!("{}\n", csaf_filename))?;
 
     // generate an index.html file listing all the files in the current_year directory
-    let mut index_file = fs::File::create(format!("{}/index.html", current_year))?;
-    let mut index_content = String::new();
-    index_content.push_str("<html><head><title>Stackable Security Advisories</title></head><body><h1>Stackable Security Advisories</h1><ul>");
-
-    // collect entries into a vec and sort them alphabetically
-    let mut entries: Vec<_> = fs::read_dir(&current_year)?.map(|entry| entry.unwrap()).collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let entry_name = entry.file_name().into_string().unwrap();
-        if entry_name != "index.html" {
-            index_content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", entry_name, entry_name));
-        }
-    }
-
-    index_content.push_str("</ul></body></html>");
-    index_file.write_all(index_content.as_bytes())?;
-
+    generate_index_html(&current_year)?;
     // generate an index.html file listing all the files in the current directory
-    let mut index_file = fs::File::create("index.html")?;
+    generate_index_html(".")?;
+
+    Ok(())
+}
+
+fn prepend_to_file(filename: &str, line: &str) -> Result<()> {
+    let mut file = OpenOptions::new().read(true).open(filename)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    contents = line.to_string() + &contents;
+    fs::write(filename, contents)?;
+    Ok(())
+}
+
+fn generate_index_html(directory: &str) -> Result<()> {
+    let mut index_file = File::create(format!("{}/index.html", directory))?;
     let mut index_content = String::new();
     index_content.push_str("<html><head><title>Stackable Security Advisories</title></head><body><h1>Stackable Security Advisories</h1><ul>");
 
-    // collect entries into a vec and sort them alphabetically
-    let mut entries: Vec<_> = fs::read_dir(".")?.map(|entry| entry.unwrap()).collect();
+    let mut entries: Vec<_> = fs::read_dir(directory)?.map(|entry| entry.unwrap()).collect();
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let entry_name = entry.file_name().into_string().unwrap();
@@ -277,6 +252,5 @@ fn main() -> Result<()> {
 
     index_content.push_str("</ul></body></html>");
     index_file.write_all(index_content.as_bytes())?;
-
     Ok(())
 }
