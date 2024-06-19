@@ -49,4 +49,4 @@ jobs:
             VERSION=dev
       -
         name: Sign the published image
-        run: cosign sign -y oci.stackable.tech/stackable/csaf_publisher@${{ steps.build-and-push-backend.outputs.digest }}
+        run: cosign sign -y oci.stackable.tech/stackable/csaf_publisher@${{ steps.build-and-push.outputs.digest }}
