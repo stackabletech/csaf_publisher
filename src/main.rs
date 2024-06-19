@@ -1,7 +1,7 @@
 use color_eyre::eyre::Context;
 use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -204,16 +204,42 @@ fn main() -> Result<()> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
-    // generate sha256 hash
-    let mut hasher = Sha256::new();
+    // generate sha512 hash
+    let mut hasher = Sha512::new();
     hasher.update(&buffer);
     let result = hasher.finalize();
-    let hash = format!("{:x}", result);
+    let hash = format!("{:x}  {}", result, csaf_filename);
 
     // write hash to file
-    let hash_filename = format!("{}/{}.sha256", current_year, filename);
+    let hash_filename = format!("{}/{}.sha512", current_year, filename);
     fs::write(hash_filename, hash)?;
 
+    // prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
+    let mut changes_file = fs::OpenOptions::new()
+        .read(true)
+        .open("changes.csv")?;
+    let mut contents = String::new();
+    changes_file.read_to_string(&mut contents)?;
+    let changes_line = format!("{},\"{}\"\n", csaf_filename, chrono::Utc::now());
+    contents = changes_line + &contents;
+    changes_file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open("changes.csv")?;
+    changes_file.write_all(contents.as_bytes())?;
+
+    // prepend the filename to index.txt
+    let mut index_file = fs::OpenOptions::new()
+        .read(true)
+        .open("index.txt")?;
+    let mut contents = String::new();
+    index_file.read_to_string(&mut contents)?;
+    let index_line = format!("{}\n", csaf_filename);
+    contents = index_line + &contents;
+    index_file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open("index.txt")?;
 
     // generate an index.html file listing all the files in the current_year directory
     let mut index_file = fs::File::create(format!("{}/index.html", current_year))?;
