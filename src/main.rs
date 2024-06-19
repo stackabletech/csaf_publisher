@@ -1,12 +1,12 @@
 use color_eyre::eyre::Context;
 use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 
-use chrono::Datelike;
+use chrono::{Datelike, SecondsFormat};
 use color_eyre::eyre::{ContextCompat, Result};
 use csaf::{
     definitions::{Branch, BranchCategory, BranchesT},
@@ -207,15 +207,19 @@ fn main() -> Result<()> {
     // generate sha512 hash
     let mut hasher = Sha512::new();
     hasher.update(&buffer);
-    let result = hasher.finalize();
-    let hash = format!("{:x}  {}", result, csaf_filename);
-
-    // write hash to file
+    let hash = format!("{:x}  {}", hasher.finalize(), csaf_filename);
     let hash_filename = format!("{}/{}.sha512", current_year, filename);
     fs::write(hash_filename, hash)?;
 
+    // generate sha256 hash
+    let mut hasher = Sha256::new();
+    hasher.update(&buffer);
+    let hash = format!("{:x}  {}", hasher.finalize(), csaf_filename);
+    let hash_filename = format!("{}/{}.sha256", current_year, filename);
+    fs::write(hash_filename, hash)?;
+
     // prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
-    prepend_to_file("changes.csv", &format!("{},\"{}\"\n", csaf_filename, chrono::Utc::now()))?;
+    prepend_to_file("changes.csv", &format!("{},\"{}\"\n", csaf_filename, chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)))?;
     // prepend the filename to index.txt
     prepend_to_file("index.txt", &format!("{}\n", csaf_filename))?;
 
