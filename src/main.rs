@@ -58,6 +58,9 @@ fn main() -> Result<()> {
     // Parse CSAF document from response
     let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
     csaf.document.lang = Some("en".to_string());
+    csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
+    csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
+
     let mut branches = csaf
         .product_tree
         .as_ref()
@@ -183,6 +186,16 @@ fn main() -> Result<()> {
     let csaf_filename = format!("{}/{}", current_year, filename);
     let csaf_as_string = serde_json::to_string_pretty(&csaf)?;
     fs::write(&csaf_filename, &csaf_as_string)?;
+
+    let validator_result = std::process::Command::new("/csaf_distribution-v3.0.0-gnulinux-amd64/bin-linux-amd64/csaf_validator")
+        .arg(&csaf_filename)
+        .output()?;
+    if !validator_result.status.success() {
+        eprintln!("CSAF validation failed:");
+        eprintln!("{}", String::from_utf8_lossy(&validator_result.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&validator_result.stderr));
+        std::process::exit(1);
+    }
 
     // Generate PGP signature
     let key_string = env::var("PGP_SECRET_KEY").context("Missing PGP secret key!")?;
