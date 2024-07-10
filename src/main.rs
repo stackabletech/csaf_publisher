@@ -1,4 +1,5 @@
 use color_eyre::eyre::Context;
+use csaf::definitions::Note;
 use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
 use sha2::{Digest, Sha256, Sha512};
@@ -60,6 +61,13 @@ fn main() -> Result<()> {
     csaf.document.lang = Some("en".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
+    let disclaimer = Note {
+        category: csaf::definitions::NoteCategory::LegalDisclaimer,
+        text: "This content is licensed under the Creative Commons Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/). If you distribute this content, or a modified version of it, you must provide attribution to Stackable GmbH and provide a link to the original.".to_string(),
+        title: Some("Terms of Use".to_string()),
+        audience: None
+    };
+    csaf.document.notes = Some(vec![disclaimer]);
 
     let mut branches = csaf
         .product_tree
