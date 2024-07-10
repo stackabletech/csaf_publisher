@@ -34,8 +34,8 @@ fn main() -> Result<()> {
             "title": format!("Stackable Security Advisory for: {}", vulnerability_names.join(", ")),
             "publisher_name": "Stackable GmbH",
             "publisher_category": "vendor",
-            "publisher_namespace": "http://www.stackable.tech",
-            "tracking_status": "final",
+            "publisher_namespace": "https://www.stackable.tech",
+            "tracking_status": "draft",
             "tlp_label": "WHITE"
         }))
         .header(
