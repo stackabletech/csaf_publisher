@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
     // let filename = "csaf_out.json";
-    csaf.document.lang = Some("en_US".to_string());
+    csaf.document.lang = Some("en-US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
     let disclaimer = Note {
