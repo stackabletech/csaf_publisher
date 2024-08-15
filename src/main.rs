@@ -245,7 +245,7 @@ fn main() -> Result<()> {
     // Prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
     prepend_to_file(
         "changes.csv",
-        &format!("{},\"{}\"\n", csaf_filename, csaf.document.tracking.current_release_date.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        &format!("\"{}\",\"{}\"\n", csaf_filename, csaf.document.tracking.current_release_date.to_rfc3339_opts(SecondsFormat::Secs, true)),
     )?;
     // Prepend the filename to index.txt
     prepend_to_file("index.txt", &format!("{}\n", csaf_filename))?;
