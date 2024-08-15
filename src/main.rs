@@ -192,7 +192,8 @@ fn main() -> Result<()> {
 
     // Write CSAF to file
     let csaf_filename = format!("{}/{}", current_year, filename);
-    let csaf_as_string = serde_json::to_string_pretty(&csaf)?;
+    // Create a value using `to_value` first, to sort the keys in the JSON output
+    let csaf_as_string = serde_json::to_string_pretty(&serde_json::to_value(&csaf)?)?;
     fs::write(&csaf_filename, &csaf_as_string)?;
 
     let validator_result = std::process::Command::new("/csaf_distribution-v3.0.0-gnulinux-amd64/bin-linux-amd64/csaf_validator")
