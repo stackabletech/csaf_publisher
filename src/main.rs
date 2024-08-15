@@ -58,7 +58,7 @@ fn main() -> Result<()> {
 
     // Parse CSAF document from response
     let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
-    csaf.document.lang = Some("en".to_string());
+    csaf.document.lang = Some("en_US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
     let disclaimer = Note {
