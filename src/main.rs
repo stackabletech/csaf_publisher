@@ -1,8 +1,10 @@
 use color_eyre::eyre::Context;
-use csaf::definitions::Note;
+use csaf::definitions::{FullProductName, Note, ProductIdT};
 use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
 use sha2::{Digest, Sha256, Sha512};
+use std::fs::File;
+use std::io::Read;
 use std::{env, fs};
 
 use chrono::{Datelike, SecondsFormat};
@@ -58,6 +60,8 @@ fn main() -> Result<()> {
 
     // Parse CSAF document from response
     let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
+    // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
+    // let filename = "csaf_out.json";
     csaf.document.lang = Some("en_US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
@@ -85,7 +89,20 @@ fn main() -> Result<()> {
         .context("no branch named '_components_'")?;
     let component_branch = branches.remove(component_branch_idx);
 
-    let mut sdp_branches: Vec<Branch> = vec![];
+    let mut new_branches = vec![
+        component_branch,
+        Branch {
+            name: "Stackable".to_string(),
+            category: BranchCategory::Vendor,
+            product: None,
+            branches: Some(BranchesT(vec![Branch {
+                name: "Stackable Data Platform".to_string(),
+                category: BranchCategory::ProductName,
+                product: None,
+                branches: Some(BranchesT(vec![])),
+            }])),
+        },
+    ];
 
     // Group products by sdp version
     branches
@@ -100,89 +117,119 @@ fn main() -> Result<()> {
                     .filter(|subbranch| {
                         matches!(subbranch.category, BranchCategory::ProductVersion)
                     })
-                    .for_each(|subbranch| {
+                    .for_each(|mut subbranch| {
                         // Subbranch has a product
                         if let Some(product) = subbranch.product.as_ref() {
                             // That product has a name that matches the stackable product version regex
                             if let Some(captures) =
                                 stackable_product_version_regex.captures(&product.name)
                             {
-                                // Find sdp_version branch in sdp_branches or create it
+                                // Find sdp_version branch in new_branches, create it if it doesn't exist
                                 let sdp_version = captures.name("sdpversion").unwrap().as_str();
 
-                                let sdp_version_idx = sdp_branches
-                                    .iter()
-                                    .position(|b| b.name == sdp_version)
-                                    .unwrap_or_else(|| {
-                                        let idx = sdp_branches.len();
-                                        sdp_branches.push(Branch {
+                                let version_branches = new_branches[1].branches.as_mut().unwrap().0[0].branches.as_mut().unwrap();
+
+                                if !version_branches.0.iter().any(|b| b.name == sdp_version) {
+                                    version_branches.0.push(Branch {
                                             name: sdp_version.to_string(),
                                             category: BranchCategory::ProductVersion,
-                                            product: None,
-                                            branches: Some(BranchesT(vec![])),
+                                            product: Some(FullProductName {
+                                                name: format!("Stackable Data Platform {}", sdp_version),
+                                                product_id: ProductIdT(format!("sdp:{}", sdp_version)),
+                                                product_identification_helper: None,
+                                            }),
+                                            branches: None,
                                         });
-                                        idx
-                                    });
+                                    }
 
-                                // Find product_name branch in sdp_branches or create it
+                                // Find product_name branch in new_branches or create it
                                 let product_name = captures.name("productname").unwrap().as_str();
+                                let product_version = captures.name("productversion").map(|v| v.as_str()).unwrap_or(sdp_version);
 
-                                let product_name_idx = sdp_branches[sdp_version_idx]
-                                    .branches
-                                    .as_mut()
-                                    .unwrap()
-                                    .0
+                                let mut product_full_product_name = product.clone();
+                                if product_name.ends_with("-operator") {
+                                    product_full_product_name.product_id = ProductIdT(product_name.to_string());
+                                } else {
+                                    product_full_product_name.product_id = ProductIdT(format!("{}:{}", product_name, product_version));
+                                }
+                                product_full_product_name.name = format!("{} {}", product_name, product_version);
+
+                                let stackable_branches = new_branches[1].branches.as_mut().unwrap();
+                                let product_name_idx = stackable_branches.0
                                     .iter()
                                     .position(|b| b.name == product_name)
                                     .unwrap_or_else(|| {
-                                        let idx = sdp_branches[sdp_version_idx]
-                                            .branches
-                                            .as_ref()
-                                            .unwrap()
-                                            .0
-                                            .len();
-                                        sdp_branches[sdp_version_idx]
-                                            .branches
-                                            .as_mut()
-                                            .unwrap()
-                                            .0
-                                            .push(Branch {
-                                                name: product_name.to_string(),
-                                                category: BranchCategory::ProductName,
-                                                product: None,
-                                                branches: Some(BranchesT(vec![])),
-                                            });
+                                        let idx = stackable_branches.0.len();
+
+                                        if product_name.ends_with("-operator") {
+                                            stackable_branches.0.push(Branch {
+                                                    name: product_name.to_string(),
+                                                    category: BranchCategory::ProductName,
+                                                    product: Some(
+                                                        FullProductName {
+                                                            name: product_name.to_string(),
+                                                            product_id: product_full_product_name.product_id.clone(),
+                                                            product_identification_helper: None,
+                                                        }
+                                                    ),
+                                                    branches: None,
+                                                });
+                                        } else {
+                                            stackable_branches.0.push(Branch {
+                                                    name: product_name.to_string(),
+                                                    category: BranchCategory::ProductName,
+                                                    product: None,
+                                                    branches: Some(BranchesT(vec![])),
+                                                });
+                                        }
                                         idx
                                     });
 
-                                // Append product version branch to product_name branch
-                                sdp_branches[sdp_version_idx].branches.as_mut().unwrap().0
-                                    [product_name_idx]
-                                    .branches
-                                    .as_mut()
-                                    .unwrap()
-                                    .0
-                                    .push(subbranch);
+                                let mut relation_full_product_name = product.clone();
+                                relation_full_product_name.product_id = product.product_id.clone();
+                                relation_full_product_name.name = format!("{} as part of {}", product_name, sdp_version);
+                                relation_full_product_name.product_identification_helper = product.product_identification_helper.clone();
+
+                                // Insert relationship between product_name and Stackable Data Platform
+                                csaf.product_tree.as_mut().unwrap().relationships.as_mut().unwrap().push(
+                                    csaf::product_tree::Relationship {
+                                        category: csaf::product_tree::RelationshipCategory::DefaultComponentOf,
+                                        full_product_name: relation_full_product_name,
+                                        product_reference: product_full_product_name.product_id.clone(),
+                                        relates_to_product_reference: ProductIdT(format!("sdp:{}", sdp_version)),
+                                    },
+                                );
+
+                                // Append product version branch to product_name branch if it does not exist
+                                // Only if it is not an operator, because operators always have the same version as the SDP
+                                // Hence, the operator version is already fully specified by the relationship
+                                if !product_name.ends_with("-operator") && !stackable_branches.0[product_name_idx]
+                                .branches
+                                .as_mut()
+                                .unwrap()
+                                .0
+                                .iter()
+                                .any(|b| b.name == product_full_product_name.name)
+                                {
+                                    subbranch.name = product_full_product_name.name.clone();
+                                    subbranch.product = Some(FullProductName {
+                                        name: product_full_product_name.name,
+                                        product_id: product_full_product_name.product_id,
+                                        product_identification_helper: None,
+                                    });
+
+                                    stackable_branches.0[product_name_idx]
+                                        .branches
+                                        .as_mut()
+                                        .unwrap()
+                                        .0
+                                        .push(subbranch);
+                                }
                             }
                         }
                     });
             }
         });
-
-    let new_branches = vec![
-        component_branch,
-        Branch {
-            name: "Stackable".to_string(),
-            category: BranchCategory::Vendor,
-            product: None,
-            branches: Some(BranchesT(vec![Branch {
-                name: "Stackable Data Platform".to_string(),
-                category: BranchCategory::ProductFamily,
-                product: None,
-                branches: Some(BranchesT(sdp_branches)),
-            }])),
-        },
-    ];
 
     csaf.product_tree.as_mut().unwrap().branches = Some(BranchesT(new_branches));
 
@@ -196,9 +243,11 @@ fn main() -> Result<()> {
     let csaf_as_string = serde_json::to_string_pretty(&serde_json::to_value(&csaf)?)?;
     fs::write(&csaf_filename, &csaf_as_string)?;
 
-    let validator_result = std::process::Command::new("/csaf_distribution-v3.0.0-gnulinux-amd64/bin-linux-amd64/csaf_validator")
-        .arg(&csaf_filename)
-        .output()?;
+    let validator_result = std::process::Command::new(
+        "/csaf_distribution-v3.0.0-gnulinux-amd64/bin-linux-amd64/csaf_validator",
+    )
+    .arg(&csaf_filename)
+    .output()?;
     if !validator_result.status.success() {
         eprintln!("CSAF validation failed:");
         eprintln!("{}", String::from_utf8_lossy(&validator_result.stdout));
@@ -246,7 +295,14 @@ fn main() -> Result<()> {
     // Prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
     prepend_to_file(
         "changes.csv",
-        &format!("\"{}\",\"{}\"\n", csaf_filename, csaf.document.tracking.current_release_date.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        &format!(
+            "\"{}\",\"{}\"\n",
+            csaf_filename,
+            csaf.document
+                .tracking
+                .current_release_date
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
     )?;
     // Prepend the filename to index.txt
     prepend_to_file("index.txt", &format!("{}\n", csaf_filename))?;
