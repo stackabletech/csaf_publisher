@@ -127,35 +127,49 @@ fn main() -> Result<()> {
                                 // Find sdp_version branch in new_branches, create it if it doesn't exist
                                 let sdp_version = captures.name("sdpversion").unwrap().as_str();
 
-                                let version_branches = new_branches[1].branches.as_mut().unwrap().0[0].branches.as_mut().unwrap();
+                                let version_branches = new_branches[1].branches.as_mut().unwrap().0
+                                    [0]
+                                .branches
+                                .as_mut()
+                                .unwrap();
 
                                 if !version_branches.0.iter().any(|b| b.name == sdp_version) {
                                     version_branches.0.push(Branch {
-                                            name: sdp_version.to_string(),
-                                            category: BranchCategory::ProductVersion,
-                                            product: Some(FullProductName {
-                                                name: format!("Stackable Data Platform {}", sdp_version),
-                                                product_id: ProductIdT(format!("sdp:{}", sdp_version)),
-                                                product_identification_helper: None,
-                                            }),
-                                            branches: None,
-                                        });
-                                    }
+                                        name: sdp_version.to_string(),
+                                        category: BranchCategory::ProductVersion,
+                                        product: Some(FullProductName {
+                                            name: format!(
+                                                "Stackable Data Platform {}",
+                                                sdp_version
+                                            ),
+                                            product_id: ProductIdT(format!("sdp:{}", sdp_version)),
+                                            product_identification_helper: None,
+                                        }),
+                                        branches: None,
+                                    });
+                                }
 
                                 // Find product_name branch in new_branches or create it
                                 let product_name = captures.name("productname").unwrap().as_str();
-                                let product_version = captures.name("productversion").map(|v| v.as_str()).unwrap_or(sdp_version);
+                                let product_version = captures
+                                    .name("productversion")
+                                    .map(|v| v.as_str())
+                                    .unwrap_or(sdp_version);
 
                                 let mut product_full_product_name = product.clone();
                                 if product_name.ends_with("-operator") {
-                                    product_full_product_name.product_id = ProductIdT(product_name.to_string());
+                                    product_full_product_name.product_id =
+                                        ProductIdT(product_name.to_string());
                                 } else {
-                                    product_full_product_name.product_id = ProductIdT(format!("{}:{}", product_name, product_version));
+                                    product_full_product_name.product_id =
+                                        ProductIdT(format!("{}:{}", product_name, product_version));
                                 }
-                                product_full_product_name.name = format!("{} {}", product_name, product_version);
+                                product_full_product_name.name =
+                                    format!("{} {}", product_name, product_version);
 
                                 let stackable_branches = new_branches[1].branches.as_mut().unwrap();
-                                let product_name_idx = stackable_branches.0
+                                let product_name_idx = stackable_branches
+                                    .0
                                     .iter()
                                     .position(|b| b.name == product_name)
                                     .unwrap_or_else(|| {
@@ -163,55 +177,76 @@ fn main() -> Result<()> {
 
                                         if product_name.ends_with("-operator") {
                                             stackable_branches.0.push(Branch {
+                                                name: product_name.to_string(),
+                                                category: BranchCategory::ProductName,
+                                                product: Some(FullProductName {
                                                     name: product_name.to_string(),
-                                                    category: BranchCategory::ProductName,
-                                                    product: Some(
-                                                        FullProductName {
-                                                            name: product_name.to_string(),
-                                                            product_id: product_full_product_name.product_id.clone(),
-                                                            product_identification_helper: None,
-                                                        }
-                                                    ),
-                                                    branches: None,
-                                                });
+                                                    product_id: product_full_product_name
+                                                        .product_id
+                                                        .clone(),
+                                                    product_identification_helper: None,
+                                                }),
+                                                branches: None,
+                                            });
                                         } else {
                                             stackable_branches.0.push(Branch {
-                                                    name: product_name.to_string(),
-                                                    category: BranchCategory::ProductName,
-                                                    product: None,
-                                                    branches: Some(BranchesT(vec![])),
-                                                });
+                                                name: product_name.to_string(),
+                                                category: BranchCategory::ProductName,
+                                                product: None,
+                                                branches: Some(BranchesT(vec![])),
+                                            });
                                         }
                                         idx
                                     });
 
                                 let mut relation_full_product_name = product.clone();
                                 relation_full_product_name.product_id = product.product_id.clone();
-                                relation_full_product_name.name = format!("{} as part of {}", product_name, sdp_version);
-                                relation_full_product_name.product_identification_helper = product.product_identification_helper.clone();
+                                relation_full_product_name.name =
+                                    format!("{} as part of {}", product_name, sdp_version);
+                                relation_full_product_name.product_identification_helper =
+                                    product.product_identification_helper.clone();
 
                                 // Insert relationship between product_name and Stackable Data Platform
-                                csaf.product_tree.as_mut().unwrap().relationships.as_mut().unwrap().push(
-                                    csaf::product_tree::Relationship {
-                                        category: csaf::product_tree::RelationshipCategory::DefaultComponentOf,
+                                let relationship_category = if product_name == "commons-operator"
+                                    || product_name == "secret-operator"
+                                    || product_name == "listener-operator"
+                                {
+                                    csaf::product_tree::RelationshipCategory::DefaultComponentOf
+                                } else {
+                                    csaf::product_tree::RelationshipCategory::OptionalComponentOf
+                                };
+
+                                csaf.product_tree
+                                    .as_mut()
+                                    .unwrap()
+                                    .relationships
+                                    .as_mut()
+                                    .unwrap()
+                                    .push(csaf::product_tree::Relationship {
+                                        category: relationship_category,
                                         full_product_name: relation_full_product_name,
-                                        product_reference: product_full_product_name.product_id.clone(),
-                                        relates_to_product_reference: ProductIdT(format!("sdp:{}", sdp_version)),
-                                    },
-                                );
+                                        product_reference: product_full_product_name
+                                            .product_id
+                                            .clone(),
+                                        relates_to_product_reference: ProductIdT(format!(
+                                            "sdp:{}",
+                                            sdp_version
+                                        )),
+                                    });
 
                                 // Append product version branch to product_name branch if it does not exist
                                 // Only if it is not an operator, because operators always have the same version as the SDP
                                 // Hence, the operator version is already fully specified by the relationship
-                                if !product_name.ends_with("-operator") && !stackable_branches.0[product_name_idx]
-                                .branches
-                                .as_mut()
-                                .unwrap()
-                                .0
-                                .iter()
-                                .any(|b| b.name == product_full_product_name.name)
+                                if !product_name.ends_with("-operator")
+                                    && !stackable_branches.0[product_name_idx]
+                                        .branches
+                                        .as_mut()
+                                        .unwrap()
+                                        .0
+                                        .iter()
+                                        .any(|b| b.name == product_full_product_name.name)
                                 {
-                                    subbranch.name = product_full_product_name.name.clone();
+                                    subbranch.name = product_version.to_string();
                                     subbranch.product = Some(FullProductName {
                                         name: product_full_product_name.name,
                                         product_id: product_full_product_name.product_id,
