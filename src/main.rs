@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     // let filename = "csaf_out.json";
     csaf.document.lang = Some("en-US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
-    csaf.document.publisher.contact_details = Some("security@stackable.tech".to_string());
+    csaf.document.publisher.contact_details = Some("product-security@stackable.tech".to_string());
     let disclaimer = Note {
         category: csaf::definitions::NoteCategory::LegalDisclaimer,
         text: "This content is licensed under the Creative Commons Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/). If you distribute this content, or a modified version of it, you must provide attribution to Stackable GmbH and provide a link to the original.".to_string(),
