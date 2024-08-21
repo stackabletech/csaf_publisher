@@ -240,11 +240,11 @@ fn main() -> Result<()> {
                                 if !product_name.ends_with("-operator")
                                     && !stackable_branches.0[product_name_idx]
                                         .branches
-                                        .as_mut()
+                                        .as_ref()
                                         .unwrap()
                                         .0
                                         .iter()
-                                        .any(|b| b.name == product_full_product_name.name)
+                                        .any(|b| b.name == product_version)
                                 {
                                     subbranch.name = product_version.to_string();
                                     subbranch.product = Some(FullProductName {
