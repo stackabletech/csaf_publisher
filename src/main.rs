@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     };
     csaf.document.notes = Some(vec![disclaimer]);
 
-    let mut branches = csaf
+    let branches = csaf
         .product_tree
         .as_ref()
         .context("missing product tree")?
@@ -82,32 +82,25 @@ fn main() -> Result<()> {
         .context("missing branches in product tree")?
         .0
         .clone();
-    // Find branch with name "_components_", store it in "component_branch" and remove it from the vec
-    let component_branch_idx = branches
-        .iter()
-        .position(|b| b.name == "_components_")
-        .context("no branch named '_components_'")?;
-    let component_branch = branches.remove(component_branch_idx);
 
-    let mut new_branches = vec![
-        component_branch,
-        Branch {
-            name: "Stackable".to_string(),
-            category: BranchCategory::Vendor,
+    let (sdp_branches, mut new_branches): (Vec<_>, Vec<_>) = branches.into_iter()
+    .partition(|branch| matches!(branch.category, BranchCategory::ProductFamily));
+
+    new_branches.insert(0, Branch {
+        name: "Stackable".to_string(),
+        category: BranchCategory::Vendor,
+        product: None,
+        branches: Some(BranchesT(vec![Branch {
+            name: "Stackable Data Platform".to_string(),
+            category: BranchCategory::ProductName,
             product: None,
-            branches: Some(BranchesT(vec![Branch {
-                name: "Stackable Data Platform".to_string(),
-                category: BranchCategory::ProductName,
-                product: None,
-                branches: Some(BranchesT(vec![])),
-            }])),
-        },
-    ];
+            branches: Some(BranchesT(vec![])),
+        }])),
+    });
 
     // Group products by sdp version
-    branches
+    sdp_branches
         .into_iter()
-        .filter(|branch| matches!(branch.category, BranchCategory::ProductFamily))
         .for_each(|branch| {
             if let Some(subbranches) = branch.branches {
                 subbranches
@@ -127,7 +120,7 @@ fn main() -> Result<()> {
                                 // Find sdp_version branch in new_branches, create it if it doesn't exist
                                 let sdp_version = captures.name("sdpversion").unwrap().as_str();
 
-                                let version_branches = new_branches[1].branches.as_mut().unwrap().0
+                                let version_branches = new_branches[0].branches.as_mut().unwrap().0
                                     [0]
                                 .branches
                                 .as_mut()
@@ -167,7 +160,7 @@ fn main() -> Result<()> {
                                 product_full_product_name.name =
                                     format!("{} {}", product_name, product_version);
 
-                                let stackable_branches = new_branches[1].branches.as_mut().unwrap();
+                                let stackable_branches = new_branches[0].branches.as_mut().unwrap();
                                 let product_name_idx = stackable_branches
                                     .0
                                     .iter()
