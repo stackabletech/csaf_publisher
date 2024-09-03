@@ -1,20 +1,22 @@
-FROM docker.stackable.tech/stackable/ubi8-rust-builder AS builder
+FROM oci.stackable.tech/sdp/ubi9-rust-builder AS builder
 
-FROM registry.access.redhat.com/ubi8/ubi-minimal:8.9@sha256:87bcbfedfd70e67aab3875fff103bade460aeff510033ebb36b7efa009ab6639 AS operator
+FROM registry.access.redhat.com/ubi9/nodejs-20-minimal@sha256:d20b9ccb915d538ea4a22f254ea9d19f1185f627c1c61747597c2896a053a915 AS operator
 
 
 ARG VERSION
 ARG RELEASE="1"
 
-# Update image
+USER root
+
 RUN microdnf update -y && microdnf install -y tar && microdnf clean all && mkdir /stackable
 
-RUN curl -LO https://github.com/csaf-poc/csaf_distribution/releases/download/v3.0.0/csaf_distribution-v3.0.0-gnulinux-amd64.tar.gz && \
-    tar xvfz csaf_distribution-v3.0.0-gnulinux-amd64.tar.gz -C / && \
-    rm csaf_distribution-v3.0.0-gnulinux-amd64.tar.gz
+
+COPY csaf_validator /csaf_validator
+RUN cd /csaf_validator && npm install
 
 COPY --from=builder /app/csaf_publisher /
 
 WORKDIR /stackable
+USER 1001
 
 ENTRYPOINT ["/csaf_publisher"]

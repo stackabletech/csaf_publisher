@@ -1,0 +1,6 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@secvisogram/csaf-validator-lib": "^1.3.36"
+  }
+}

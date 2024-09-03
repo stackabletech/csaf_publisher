@@ -271,15 +271,15 @@ fn main() -> Result<()> {
     let csaf_as_string = serde_json::to_string_pretty(&serde_json::to_value(&csaf)?)?;
     fs::write(&csaf_filename, &csaf_as_string)?;
 
-    let validator_result = std::process::Command::new(
-        "/csaf_distribution-v3.0.0-gnulinux-amd64/bin-linux-amd64/csaf_validator",
-    )
-    .arg(&csaf_filename)
+    let validator_result = std::process::Command::new("node")
+    .arg("/csaf_validator/validate.js")
+    .arg(format!("{}/{}", env::current_dir()?.to_string_lossy(), &csaf_filename))
     .output()?;
     if !validator_result.status.success() {
         eprintln!("CSAF validation failed:");
         eprintln!("{}", String::from_utf8_lossy(&validator_result.stdout));
         eprintln!("{}", String::from_utf8_lossy(&validator_result.stderr));
+        println!("CSAF content:\n{}", csaf_as_string);
         std::process::exit(1);
     }
 
