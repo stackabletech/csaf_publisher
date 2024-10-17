@@ -92,7 +92,7 @@ fn main() -> Result<()> {
         product: None,
         branches: Some(BranchesT(vec![Branch {
             name: "Stackable Data Platform".to_string(),
-            category: BranchCategory::ProductName,
+            category: BranchCategory::ProductFamily,
             product: None,
             branches: Some(BranchesT(vec![])),
         }])),
@@ -120,14 +120,14 @@ fn main() -> Result<()> {
                                 // Find sdp_version branch in new_branches, create it if it doesn't exist
                                 let sdp_version = captures.name("sdpversion").unwrap().as_str();
 
-                                let version_branches = new_branches[0].branches.as_mut().unwrap().0
+                                let sdp_version_branches = new_branches[0].branches.as_mut().unwrap().0
                                     [0]
                                 .branches
                                 .as_mut()
                                 .unwrap();
 
-                                if !version_branches.0.iter().any(|b| b.name == sdp_version) {
-                                    version_branches.0.push(Branch {
+                                if !sdp_version_branches.0.iter().any(|b| b.name == sdp_version) {
+                                    sdp_version_branches.0.push(Branch {
                                         name: sdp_version.to_string(),
                                         category: BranchCategory::ProductVersion,
                                         product: Some(FullProductName {
@@ -142,26 +142,52 @@ fn main() -> Result<()> {
                                     });
                                 }
 
-                                // Find product_name branch in new_branches or create it
                                 let product_name = captures.name("productname").unwrap().as_str();
                                 let product_version = captures
                                     .name("productversion")
                                     .map(|v| v.as_str())
                                     .unwrap_or(sdp_version);
 
+                                let product_architecture = captures
+                                    .name("architecture")
+                                    .map(|v| v.as_str())
+                                    .unwrap();
+
                                 let mut product_full_product_name = product.clone();
                                 if product_name.ends_with("-operator") {
                                     product_full_product_name.product_id =
-                                        ProductIdT(product_name.to_string());
+                                        ProductIdT(format!("{}-{}", product_name, product_architecture));
+                                    product_full_product_name.name =
+                                    format!("{} on {}", product_name, product_architecture);
                                 } else {
                                     product_full_product_name.product_id =
-                                        ProductIdT(format!("{}:{}", product_name, product_version));
+                                        ProductIdT(format!("{}:{}-{}", product_name, product_version, product_architecture));
+                                    product_full_product_name.name =
+                                    format!("{} {} on {}", product_name, product_version, product_architecture);
                                 }
-                                product_full_product_name.name =
-                                    format!("{} {}", product_name, product_version);
-
                                 let stackable_branches = new_branches[0].branches.as_mut().unwrap();
-                                let product_name_idx = stackable_branches
+
+                                // Find architecture branch in stackable_branches or create it
+                                let architecture_idx = stackable_branches
+                                    .0
+                                    .iter()
+                                    .position(|b| b.name == product_architecture)
+                                    .unwrap_or_else(|| {
+                                        let idx = stackable_branches.0.len();
+                                        stackable_branches.0.push(Branch {
+                                            name: product_architecture.to_string(),
+                                            category: BranchCategory::Architecture,
+                                            product: None,
+                                            branches: Some(BranchesT(vec![])),
+                                        });
+                                        idx
+                                    });
+
+                                // Find product_name branch in architecture branch or create it
+                                let product_name_idx = stackable_branches.0[architecture_idx]
+                                    .branches
+                                    .as_mut()
+                                    .unwrap()
                                     .0
                                     .iter()
                                     .position(|b| b.name == product_name)
