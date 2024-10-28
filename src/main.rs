@@ -231,14 +231,17 @@ fn main() -> Result<()> {
                                     idx
                                 });
 
-                            let mut relation_full_product_name = product.clone();
-                            relation_full_product_name.product_id = product.product_id.clone();
-                            relation_full_product_name.name = format!(
-                                "{} {} as part of SDP {}",
-                                product_name, product_version, sdp_version
-                            );
-                            relation_full_product_name.product_identification_helper =
-                                product.product_identification_helper.clone();
+                            let relation_full_product_name = FullProductName {
+                                name: format!(
+                                    "{} {} as part of SDP {}",
+                                    product_name, product_version, sdp_version
+                                ),
+                                product_id: ProductIdT(format!(
+                                    "{}:{}-stackable{}-{}",
+                                    product_name, product_version, sdp_version, product_architecture
+                                )),
+                                product_identification_helper: product.product_identification_helper.clone(),
+                            };
 
                             // Insert relationship between product_name and Stackable Data Platform
                             let relationship_category = if product_name == "commons-operator"
