@@ -1,5 +1,5 @@
 use color_eyre::eyre::Context;
-use csaf::definitions::{FullProductName, Note, ProductIdT};
+use csaf::definitions::Note;
 use pgp::ArmorOptions;
 use pgp::{Deserializable, Message, SignedSecretKey};
 use sha2::{Digest, Sha256, Sha512};
@@ -18,7 +18,7 @@ use regex::Regex;
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let stackable_product_version_regex = Regex::new(r"^(?P<productname>[a-zA-Z0-9\-_]+):(?P<prefix>(?P<productversion>.+)\-stackable)?(?P<sdpversion>\d+\.\d+\.\d+(\-dev))?(\-(?P<architecture>arm64|amd64)?)$").unwrap();
+    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
 
     let secobserve_api_token =
         env::var("SECOBSERVE_API_TOKEN").context("Missing SecObserve API token!")?;
@@ -112,12 +112,11 @@ fn main() -> Result<()> {
                         if let Some(captures) =
                             stackable_product_version_regex.captures(&product.name)
                         {
-                            // Find sdp_version branch in SDP family branch, create it if it doesn't exist
-                            let sdp_version = captures.name("sdpversion").unwrap().as_str();
-
-                            let product_name = captures.name("productname").unwrap().as_str();
+                            let sdp_version = captures.name("sdp_version").unwrap().as_str();
+                            let product_name = captures.name("product_name").unwrap().as_str();
+                            let full_version = captures.name("full_version").unwrap().as_str();
                             let product_version = captures
-                                .name("productversion")
+                                .name("product_version")
                                 .map(|v| v.as_str())
                                 .unwrap_or(sdp_version);
 
@@ -149,56 +148,6 @@ fn main() -> Result<()> {
                                 .as_mut()
                                 .unwrap();
 
-                            // Check if SDP family branch already created
-                            if architecture_branch_subbranches.0.is_empty() {
-                                architecture_branch_subbranches.0.push(Branch {
-                                    name: "Stackable Data Platform".to_string(),
-                                    category: BranchCategory::ProductFamily,
-                                    product: None,
-                                    branches: Some(BranchesT(vec![])),
-                                });
-                            }
-
-                            let sdp_version_branches = architecture_branch_subbranches.0[0]
-                                .branches
-                                .as_mut()
-                                .unwrap();
-
-                            if !sdp_version_branches.0.iter().any(|b| b.name == sdp_version) {
-                                sdp_version_branches.0.push(Branch {
-                                    name: sdp_version.to_string(),
-                                    category: BranchCategory::ProductVersion,
-                                    product: Some(FullProductName {
-                                        name: format!("Stackable Data Platform {}", sdp_version),
-                                        product_id: ProductIdT(format!(
-                                            "sdp:{}-{}",
-                                            sdp_version, product_architecture
-                                        )),
-                                        product_identification_helper: None,
-                                    }),
-                                    branches: None,
-                                });
-                            }
-
-                            let mut product_full_product_name = product.clone();
-                            if product_name.ends_with("-operator") {
-                                product_full_product_name.product_id = ProductIdT(format!(
-                                    "{}-{}",
-                                    product_name, product_architecture
-                                ));
-                                product_full_product_name.name =
-                                    format!("{} on {}", product_name, product_architecture);
-                            } else {
-                                product_full_product_name.product_id = ProductIdT(format!(
-                                    "{}:{}-{}",
-                                    product_name, product_version, product_architecture
-                                ));
-                                product_full_product_name.name = format!(
-                                    "{} {} on {}",
-                                    product_name, product_version, product_architecture
-                                );
-                            }
-
                             // Find product_name branch in architecture branch or create it
                             let product_name_idx = architecture_branch_subbranches
                                 .0
@@ -207,73 +156,17 @@ fn main() -> Result<()> {
                                 .unwrap_or_else(|| {
                                     let idx = architecture_branch_subbranches.0.len();
 
-                                    if product_name.ends_with("-operator") {
-                                        architecture_branch_subbranches.0.push(Branch {
-                                            name: product_name.to_string(),
-                                            category: BranchCategory::ProductName,
-                                            product: Some(FullProductName {
-                                                name: product_name.to_string(),
-                                                product_id: product_full_product_name
-                                                    .product_id
-                                                    .clone(),
-                                                product_identification_helper: None,
-                                            }),
-                                            branches: None,
-                                        });
-                                    } else {
-                                        architecture_branch_subbranches.0.push(Branch {
-                                            name: product_name.to_string(),
-                                            category: BranchCategory::ProductName,
-                                            product: None,
-                                            branches: Some(BranchesT(vec![])),
-                                        });
-                                    }
+                                    architecture_branch_subbranches.0.push(Branch {
+                                        name: product_name.to_string(),
+                                        category: BranchCategory::ProductName,
+                                        product: None,
+                                        branches: Some(BranchesT(vec![])),
+                                    });
                                     idx
                                 });
 
-                            let relation_full_product_name = FullProductName {
-                                name: format!(
-                                    "{} {} as part of SDP {}",
-                                    product_name, product_version, sdp_version
-                                ),
-                                product_id: ProductIdT(format!(
-                                    "{}:{}-stackable{}-{}",
-                                    product_name, product_version, sdp_version, product_architecture
-                                )),
-                                product_identification_helper: product.product_identification_helper.clone(),
-                            };
-
-                            // Insert relationship between product_name and Stackable Data Platform
-                            let relationship_category = if product_name == "commons-operator"
-                                || product_name == "secret-operator"
-                                || product_name == "listener-operator"
-                            {
-                                csaf::product_tree::RelationshipCategory::DefaultComponentOf
-                            } else {
-                                csaf::product_tree::RelationshipCategory::OptionalComponentOf
-                            };
-
-                            csaf.product_tree
-                                .as_mut()
-                                .unwrap()
-                                .relationships
-                                .as_mut()
-                                .unwrap()
-                                .push(csaf::product_tree::Relationship {
-                                    category: relationship_category,
-                                    full_product_name: relation_full_product_name,
-                                    product_reference: product_full_product_name.product_id.clone(),
-                                    relates_to_product_reference: ProductIdT(format!(
-                                        "sdp:{}-{}",
-                                        sdp_version, product_architecture
-                                    )),
-                                });
-
                             // Append product version branch to product_name branch if it does not exist
-                            // Only if it is not an operator, because operators always have the same version as the SDP
-                            // Hence, the operator version is already fully specified by the relationship
-                            if !product_name.ends_with("-operator")
-                                && !architecture_branch_subbranches.0[product_name_idx]
+                            if !architecture_branch_subbranches.0[product_name_idx]
                                     .branches
                                     .as_ref()
                                     .unwrap()
@@ -281,12 +174,8 @@ fn main() -> Result<()> {
                                     .iter()
                                     .any(|b| b.name == product_version)
                             {
-                                subbranch.name = product_version.to_string();
-                                subbranch.product = Some(FullProductName {
-                                    name: product_full_product_name.name,
-                                    product_id: product_full_product_name.product_id,
-                                    product_identification_helper: None,
-                                });
+                                subbranch.name = full_version.to_string();
+                                subbranch.product = Some(product.clone());
 
                                 architecture_branch_subbranches.0[product_name_idx]
                                     .branches
