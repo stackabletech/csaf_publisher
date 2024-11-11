@@ -18,7 +18,7 @@ use regex::Regex;
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev))?(\-(?P<architecture>arm64|amd64)?))$").unwrap();
+    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
 
     let secobserve_api_token =
         env::var("SECOBSERVE_API_TOKEN").context("Missing SecObserve API token!")?;
