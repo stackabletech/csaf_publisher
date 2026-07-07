@@ -1,10 +1,9 @@
 use color_eyre::eyre::Context;
 use csaf::definitions::Note;
-use pgp::ArmorOptions;
-use pgp::{Deserializable, Message, SignedSecretKey};
+use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecretKey};
+use pgp::crypto::hash::HashAlgorithm;
+use pgp::types::Password;
 use sha2::{Digest, Sha256, Sha512};
-use std::fs::File;
-use std::io::Read;
 use std::{env, fs};
 
 use chrono::{Datelike, SecondsFormat};
@@ -224,18 +223,20 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Generate PGP signature
+    // Generate detached PGP signature
     let key_string = env::var("PGP_SECRET_KEY").context("Missing PGP secret key!")?;
-    let (secret_key, _headers) = SignedSecretKey::from_string(&key_string).unwrap();
-    let mut signature_filehandle = fs::File::create(format!("{}/{}.asc", current_year, filename))?;
-    let pgp_message = Message::new_literal(csaf_filename.as_bytes(), &csaf_as_string).sign(
-        &secret_key,
-        || env::var("PGP_SECRET_KEY_PASSPHRASE").expect("Missing PGP secret key passphrase!"),
-        pgp::crypto::hash::HashAlgorithm::SHA2_256,
+    let (secret_key, _headers) = SignedSecretKey::from_string(&key_string)?;
+    let passphrase =
+        env::var("PGP_SECRET_KEY_PASSPHRASE").context("Missing PGP secret key passphrase!")?;
+    let signature = DetachedSignature::sign_binary_data(
+        rand::thread_rng(),
+        &secret_key.primary_key,
+        &Password::from(passphrase),
+        HashAlgorithm::Sha256,
+        csaf_as_string.as_bytes(),
     )?;
-    pgp_message
-        .into_signature()
-        .to_armored_writer(&mut signature_filehandle, ArmorOptions::default())?;
+    let mut signature_filehandle = fs::File::create(format!("{}/{}.asc", current_year, filename))?;
+    signature.to_armored_writer(&mut signature_filehandle, ArmorOptions::default())?;
 
     // Read CSAF file into buffer
     let buffer = fs::read(&csaf_filename)?;
@@ -246,12 +247,12 @@ fn main() -> Result<()> {
             "sha512" => {
                 let mut hasher = Sha512::new();
                 hasher.update(&buffer);
-                format!("{:x}  {}", hasher.finalize(), csaf_filename)
+                format!("{}  {}", hex::encode(hasher.finalize()), csaf_filename)
             }
             "sha256" => {
                 let mut hasher = Sha256::new();
                 hasher.update(&buffer);
-                format!("{:x}  {}", hasher.finalize(), csaf_filename)
+                format!("{}  {}", hex::encode(hasher.finalize()), csaf_filename)
             }
             _ => unreachable!(),
         };
