@@ -58,8 +58,14 @@ fn main() -> Result<()> {
         .context("missing filename in Content-Disposition header")?
         .replace('"', "");
 
-    // Parse CSAF document from response
-    let mut csaf: Csaf = serde_json::from_str(&response.text()?)?;
+    // Parse CSAF document from response. SecObserve can emit a `cpe` in the
+    // product identification helper (often an empty string or a CPE 2.3 formatted
+    // string). The `csaf` crate parses `cpe` via the `cpe` crate, which only
+    // understands the CPE 2.2 URI binding and rejects everything else with
+    // "invalid prefix". We do not use `cpe` downstream, so strip it before parsing.
+    let mut csaf_value: serde_json::Value = serde_json::from_str(&response.text()?)?;
+    sanitize_product_identification_helpers(&mut csaf_value);
+    let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
     // let filename = "csaf_out.json";
     csaf.document.lang = Some("en-US".to_string());
@@ -167,12 +173,12 @@ fn main() -> Result<()> {
 
                             // Append product version branch to product_name branch if it does not exist
                             if !architecture_branch_subbranches.0[product_name_idx]
-                                    .branches
-                                    .as_ref()
-                                    .unwrap()
-                                    .0
-                                    .iter()
-                                    .any(|b| b.name == product_version)
+                                .branches
+                                .as_ref()
+                                .unwrap()
+                                .0
+                                .iter()
+                                .any(|b| b.name == product_version)
                             {
                                 subbranch.name = full_version.to_string();
                                 subbranch.product = Some(product.clone());
@@ -277,6 +283,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Removes `cpe` entries and empty `purl` entries from every
+/// `product_identification_helper` in a CSAF document.
+///
+/// The `csaf` crate parses `cpe` through the `cpe` crate, which only supports
+/// the CPE 2.2 URI binding (`cpe:/...`) and rejects empty strings and CPE 2.3
+/// formatted strings with an "invalid prefix" error. As we do not use `cpe`
+/// downstream, dropping it keeps the tool working regardless of what SecObserve
+/// emits. Empty `purl` strings are dropped for the same reason.
+fn sanitize_product_identification_helpers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(helper)) =
+                map.get_mut("product_identification_helper")
+            {
+                helper.remove("cpe");
+                if let Some(serde_json::Value::String(purl)) = helper.get("purl") {
+                    if purl.is_empty() {
+                        helper.remove("purl");
+                    }
+                }
+            }
+            for nested in map.values_mut() {
+                sanitize_product_identification_helpers(nested);
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(sanitize_product_identification_helpers),
+        _ => {}
+    }
+}
+
 fn prepend_to_file(filename: &str, line: &str) -> Result<()> {
     let mut contents = fs::read_to_string(filename)?;
     contents.insert_str(0, line);
@@ -305,4 +343,45 @@ fn generate_index_html(directory: &str) -> Result<()> {
     fs::write(format!("{}/index.html", directory), index_content)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_product_identification_helpers;
+    use serde_json::json;
+
+    #[test]
+    fn drops_cpe_and_empty_purl_while_keeping_valid_purl() {
+        let mut value = json!({
+            "product_tree": {
+                "branches": [{
+                    "product": {
+                        "product_identification_helper": {
+                            "cpe": "cpe:2.3:a:so:comp:1.0.0:*:*:*:*:*:*:*",
+                            "purl": "pkg:maven/org.yaml/snakeyaml@1.30"
+                        }
+                    }
+                }, {
+                    "product": {
+                        "product_identification_helper": {
+                            "cpe": "",
+                            "purl": ""
+                        }
+                    }
+                }]
+            }
+        });
+
+        sanitize_product_identification_helpers(&mut value);
+
+        let first =
+            &value["product_tree"]["branches"][0]["product"]["product_identification_helper"];
+        assert!(first.get("cpe").is_none());
+        assert_eq!(first["purl"], "pkg:maven/org.yaml/snakeyaml@1.30");
+
+        let second =
+            &value["product_tree"]["branches"][1]["product"]["product_identification_helper"];
+        assert!(second.get("cpe").is_none());
+        assert!(second.get("purl").is_none());
+    }
 }
