@@ -36,7 +36,7 @@ fn main() -> Result<()> {
             "publisher_name": "Stackable GmbH",
             "publisher_category": "vendor",
             "publisher_namespace": "https://www.stackable.tech",
-            "tracking_status": "draft",
+            "tracking_status": "final",
             "tlp_label": "WHITE"
         }))
         .header(
