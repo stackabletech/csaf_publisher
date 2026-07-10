@@ -1,5 +1,6 @@
 use color_eyre::eyre::Context;
 use csaf::definitions::Note;
+use csaf::document::Revision;
 use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecretKey};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::Password;
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256, Sha512};
 use std::{env, fs};
 
 use chrono::{Datelike, SecondsFormat};
-use color_eyre::eyre::{ContextCompat, Result};
+use color_eyre::eyre::{bail, ContextCompat, Result};
 use csaf::{
     definitions::{Branch, BranchCategory, BranchesT},
     Csaf,
@@ -17,22 +18,42 @@ use regex::Regex;
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
-
     let secobserve_api_token =
         env::var("SECOBSERVE_API_TOKEN").context("Missing SecObserve API token!")?;
 
     // Collect command-line arguments for vulnerability names
     let vulnerability_names: Vec<String> = env::args().skip(1).collect();
+    if vulnerability_names.is_empty() {
+        bail!("no vulnerability names given");
+    }
+
+    // One CSAF document per vulnerability, so that the filename can be derived
+    // from the vulnerability id (CSAF requirement 11: the filename must be the
+    // document tracking id in lowercase).
+    for vulnerability_name in &vulnerability_names {
+        publish_advisory(vulnerability_name, &secobserve_api_token)?;
+    }
+
+    // Generate directory listings
+    for year_directory in year_directories()? {
+        generate_index_html(&year_directory)?;
+    }
+    generate_index_html(".")?;
+
+    Ok(())
+}
+
+fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Result<()> {
+    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
 
     // Retrieve CSAF document from SecObserve API
     let client = reqwest::blocking::Client::new();
     let response = client
         .post("https://secobserve-backend.stackable.tech/api/vex/csaf_document/create/")
         .json(&serde_json::json!({
-            "vulnerability_names": &vulnerability_names,
+            "vulnerability_names": &[vulnerability_name],
             "document_id_prefix": "STACKSA",
-            "title": format!("Stackable Security Advisory for: {}", vulnerability_names.join(", ")),
+            "title": format!("Stackable Security Advisory for: {}", vulnerability_name),
             "publisher_name": "Stackable GmbH",
             "publisher_category": "vendor",
             "publisher_namespace": "https://www.stackable.tech",
@@ -46,17 +67,6 @@ fn main() -> Result<()> {
         .header("User-Agent", "Stackable Security Advisory Generator")
         .send()?;
 
-    // Extract filename from response headers
-    let filename = response
-        .headers()
-        .get("Content-Disposition")
-        .context("missing Content-Disposition header")?
-        .to_str()?
-        .split("filename=")
-        .last()
-        .context("missing filename in Content-Disposition header")?
-        .replace('"', "");
-
     // Parse CSAF document from response. SecObserve can emit a `cpe` in the
     // product identification helper (often an empty string or a CPE 2.3 formatted
     // string). The `csaf` crate parses `cpe` via the `cpe` crate, which only
@@ -66,7 +76,6 @@ fn main() -> Result<()> {
     sanitize_product_identification_helpers(&mut csaf_value);
     let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
-    // let filename = "csaf_out.json";
     csaf.document.lang = Some("en-US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("product-security@stackable.tech".to_string());
@@ -197,12 +206,52 @@ fn main() -> Result<()> {
 
     csaf.product_tree.as_mut().unwrap().branches = Some(BranchesT(new_branches));
 
-    // Prepare output directory and filenames
-    let current_year = chrono::Local::now().year().to_string();
-    fs::create_dir_all(&current_year)?;
+    // The document tracking id is the vulnerability id, so that the filename
+    // (the lowercased tracking id, see CSAF requirement 11) is stable across
+    // republications and an existing advisory can be updated in place.
+    csaf.document.tracking.id = vulnerability_name.to_string();
+    let filename = format!("{}.json", sanitize_filename(vulnerability_name));
 
-    // Write CSAF to file
-    let csaf_filename = format!("{}/{}", current_year, filename);
+    // If an advisory for this vulnerability was already published, update it in
+    // place: keep its location (the year directory of the initial release, see
+    // CSAF requirement 12), its initial release date and its revision history.
+    let csaf_filename = match find_existing_advisory(&filename)? {
+        Some(existing_csaf_filename) => {
+            let existing_csaf: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&existing_csaf_filename)?)?;
+            let existing_tracking = existing_csaf
+                .get("document")
+                .and_then(|document| document.get("tracking"))
+                .context("missing tracking data in existing advisory")?;
+
+            let mut revision_history: Vec<Revision> =
+                serde_json::from_value(existing_tracking["revision_history"].clone())?;
+            let new_version = revision_history
+                .iter()
+                .map(|revision| revision.number.parse::<u64>().unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            revision_history.push(Revision {
+                date: csaf.document.tracking.current_release_date,
+                legacy_version: None,
+                number: new_version.to_string(),
+                summary: "Updated advisory".to_string(),
+            });
+
+            csaf.document.tracking.initial_release_date =
+                serde_json::from_value(existing_tracking["initial_release_date"].clone())?;
+            csaf.document.tracking.revision_history = revision_history;
+            csaf.document.tracking.version = new_version.to_string();
+
+            existing_csaf_filename
+        }
+        None => {
+            let current_year = chrono::Local::now().year().to_string();
+            fs::create_dir_all(&current_year)?;
+            format!("{}/{}", current_year, filename)
+        }
+    };
     // Create a value using `to_value` first, to sort the keys in the JSON output
     let csaf_as_string = serde_json::to_string_pretty(&serde_json::to_value(&csaf)?)?;
     fs::write(&csaf_filename, &csaf_as_string)?;
@@ -235,7 +284,7 @@ fn main() -> Result<()> {
         HashAlgorithm::Sha256,
         csaf_as_string.as_bytes(),
     )?;
-    let mut signature_filehandle = fs::File::create(format!("{}/{}.asc", current_year, filename))?;
+    let mut signature_filehandle = fs::File::create(format!("{}.asc", csaf_filename))?;
     signature.to_armored_writer(&mut signature_filehandle, ArmorOptions::default())?;
 
     // Read CSAF file into buffer
@@ -256,30 +305,25 @@ fn main() -> Result<()> {
             }
             _ => unreachable!(),
         };
-        fs::write(
-            format!("{}/{}.{}", current_year, filename, hash_filename),
-            hash,
-        )?;
+        fs::write(format!("{}.{}", csaf_filename, hash_filename), hash)?;
     }
 
     // Prepend to changes.csv, like this: "2020/example_company_-_2020-yh4711.json","2020-07-01T10:09:07Z"
-    prepend_to_file(
+    // On updates, the old entry for this advisory is replaced.
+    upsert_line(
         "changes.csv",
         &format!(
-            "\"{}\",\"{}\"\n",
+            "\"{}\",\"{}\"",
             csaf_filename,
             csaf.document
                 .tracking
                 .current_release_date
                 .to_rfc3339_opts(SecondsFormat::Secs, true)
         ),
+        &format!("\"{}\",", csaf_filename),
     )?;
-    // Prepend the filename to index.txt
-    prepend_to_file("index.txt", &format!("{}\n", csaf_filename))?;
-
-    // Generate directory listings
-    generate_index_html(&current_year)?;
-    generate_index_html(".")?;
+    // Prepend the filename to index.txt, unless it is already listed
+    upsert_line("index.txt", &csaf_filename, &csaf_filename)?;
 
     Ok(())
 }
@@ -316,10 +360,66 @@ fn sanitize_product_identification_helpers(value: &mut serde_json::Value) {
     }
 }
 
-fn prepend_to_file(filename: &str, line: &str) -> Result<()> {
-    let mut contents = fs::read_to_string(filename)?;
-    contents.insert_str(0, line);
-    fs::write(filename, contents)?;
+/// Converts a document tracking id into the corresponding CSAF filename
+/// (without the `.json` suffix), as defined by CSAF requirement 11: lowercase,
+/// with everything outside of `[+\-a-z0-9]` replaced by underscores.
+fn sanitize_filename(tracking_id: &str) -> String {
+    let mut filename = String::new();
+    for character in tracking_id.to_lowercase().chars() {
+        if character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || character == '+'
+            || character == '-'
+        {
+            filename.push(character);
+        } else if !filename.ends_with('_') {
+            filename.push('_');
+        }
+    }
+    filename
+}
+
+/// Returns all year directories (e.g. `2024`) in the current directory.
+fn year_directories() -> Result<Vec<String>> {
+    let mut directories = vec![];
+    for entry in fs::read_dir(".")? {
+        let entry = entry?;
+        if let Ok(name) = entry.file_name().into_string() {
+            if entry.file_type()?.is_dir()
+                && name.len() == 4
+                && name.chars().all(|c| c.is_ascii_digit())
+            {
+                directories.push(name);
+            }
+        }
+    }
+    Ok(directories)
+}
+
+/// Looks for an already published advisory with the given filename in all year
+/// directories and returns its relative path (e.g. `2024/cve-2024-2961.json`).
+fn find_existing_advisory(filename: &str) -> Result<Option<String>> {
+    for year_directory in year_directories()? {
+        let candidate = format!("{}/{}", year_directory, filename);
+        if fs::exists(&candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Prepends `line` to the file, removing any previous line that starts with
+/// `match_prefix` first.
+fn upsert_line(filename: &str, line: &str, match_prefix: &str) -> Result<()> {
+    let contents = fs::read_to_string(filename)?;
+    let mut new_contents = format!("{}\n", line);
+    for existing_line in contents.lines() {
+        if !existing_line.starts_with(match_prefix) {
+            new_contents.push_str(existing_line);
+            new_contents.push('\n');
+        }
+    }
+    fs::write(filename, new_contents)?;
     Ok(())
 }
 
@@ -348,8 +448,45 @@ fn generate_index_html(directory: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_product_identification_helpers;
+    use super::{sanitize_filename, sanitize_product_identification_helpers, upsert_line};
     use serde_json::json;
+
+    #[test]
+    fn sanitizes_tracking_ids_to_filenames() {
+        assert_eq!(sanitize_filename("CVE-2026-8838"), "cve-2026-8838");
+        assert_eq!(
+            sanitize_filename("GHSA-mjmj-j48q-9wg2"),
+            "ghsa-mjmj-j48q-9wg2"
+        );
+        assert_eq!(
+            sanitize_filename("STACKSA_2026_0011  0001"),
+            "stacksa_2026_0011_0001"
+        );
+    }
+
+    #[test]
+    fn upserts_lines_without_duplicates() {
+        let directory = std::env::temp_dir().join("csaf_publisher_upsert_test");
+        std::fs::create_dir_all(&directory).expect("failed to create test directory");
+        let file = directory.join("index.txt");
+        let file = file.to_str().expect("test path is not valid UTF-8");
+
+        std::fs::write(file, "2024/cve-2024-2961.json\n").expect("failed to write test file");
+
+        upsert_line(file, "2026/cve-2026-8838.json", "2026/cve-2026-8838.json")
+            .expect("failed to prepend new line");
+        assert_eq!(
+            std::fs::read_to_string(file).expect("failed to read test file"),
+            "2026/cve-2026-8838.json\n2024/cve-2024-2961.json\n"
+        );
+
+        upsert_line(file, "2024/cve-2024-2961.json", "2024/cve-2024-2961.json")
+            .expect("failed to upsert existing line");
+        assert_eq!(
+            std::fs::read_to_string(file).expect("failed to read test file"),
+            "2024/cve-2024-2961.json\n2026/cve-2026-8838.json\n"
+        );
+    }
 
     #[test]
     fn drops_cpe_and_empty_purl_while_keeping_valid_purl() {
