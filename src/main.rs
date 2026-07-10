@@ -44,8 +44,6 @@ fn main() -> Result<()> {
 }
 
 fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Result<()> {
-    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
-
     // Retrieve CSAF document from SecObserve API
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -67,12 +65,21 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
         .header("User-Agent", "Stackable Security Advisory Generator")
         .send()?;
 
+    // Fail with the response body, so that SecObserve errors (e.g.
+    // "Vulnerability with name ... does not exist" for a mistyped
+    // vulnerability id) show up in the output instead of a parse error.
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        bail!("SecObserve returned {status} for vulnerability {vulnerability_name:?}: {body}");
+    }
+
     // Parse CSAF document from response. SecObserve can emit a `cpe` in the
     // product identification helper (often an empty string or a CPE 2.3 formatted
     // string). The `csaf` crate parses `cpe` via the `cpe` crate, which only
     // understands the CPE 2.2 URI binding and rejects everything else with
     // "invalid prefix". We do not use `cpe` downstream, so strip it before parsing.
-    let mut csaf_value: serde_json::Value = serde_json::from_str(&response.text()?)?;
+    let mut csaf_value: serde_json::Value = serde_json::from_str(&body)?;
     sanitize_product_identification_helpers(&mut csaf_value);
     let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
@@ -97,112 +104,7 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
         .0
         .clone();
 
-    let (sdp_branches, mut new_branches): (Vec<_>, Vec<_>) = branches
-        .into_iter()
-        .partition(|branch| matches!(branch.category, BranchCategory::ProductFamily));
-
-    new_branches.insert(
-        0,
-        Branch {
-            name: "Stackable".to_string(),
-            category: BranchCategory::Vendor,
-            product: None,
-            branches: Some(BranchesT(vec![])),
-        },
-    );
-
-    // Group products by sdp version
-    sdp_branches.into_iter().for_each(|branch| {
-        if let Some(subbranches) = branch.branches {
-            subbranches
-                .0
-                .into_iter()
-                // Loop over all product versions of the product family
-                .filter(|subbranch| matches!(subbranch.category, BranchCategory::ProductVersion))
-                .for_each(|mut subbranch| {
-                    // Subbranch has a product
-                    if let Some(product) = subbranch.product.as_ref() {
-                        // That product has a name that matches the stackable product version regex
-                        if let Some(captures) =
-                            stackable_product_version_regex.captures(&product.name)
-                        {
-                            let sdp_version = captures.name("sdp_version").unwrap().as_str();
-                            let product_name = captures.name("product_name").unwrap().as_str();
-                            let full_version = captures.name("full_version").unwrap().as_str();
-                            let product_version = captures
-                                .name("product_version")
-                                .map(|v| v.as_str())
-                                .unwrap_or(sdp_version);
-
-                            let product_architecture =
-                                captures.name("architecture").map(|v| v.as_str()).unwrap();
-
-                            let stackable_architecture_branches =
-                                new_branches[0].branches.as_mut().unwrap();
-
-                            // Find architecture branch in stackable_branches or create it
-                            let architecture_idx = stackable_architecture_branches
-                                .0
-                                .iter()
-                                .position(|b| b.name == product_architecture)
-                                .unwrap_or_else(|| {
-                                    let idx = stackable_architecture_branches.0.len();
-                                    stackable_architecture_branches.0.push(Branch {
-                                        name: product_architecture.to_string(),
-                                        category: BranchCategory::Architecture,
-                                        product: None,
-                                        branches: Some(BranchesT(vec![])),
-                                    });
-                                    idx
-                                });
-
-                            let architecture_branch_subbranches = stackable_architecture_branches.0
-                                [architecture_idx]
-                                .branches
-                                .as_mut()
-                                .unwrap();
-
-                            // Find product_name branch in architecture branch or create it
-                            let product_name_idx = architecture_branch_subbranches
-                                .0
-                                .iter()
-                                .position(|b| b.name == product_name)
-                                .unwrap_or_else(|| {
-                                    let idx = architecture_branch_subbranches.0.len();
-
-                                    architecture_branch_subbranches.0.push(Branch {
-                                        name: product_name.to_string(),
-                                        category: BranchCategory::ProductName,
-                                        product: None,
-                                        branches: Some(BranchesT(vec![])),
-                                    });
-                                    idx
-                                });
-
-                            // Append product version branch to product_name branch if it does not exist
-                            if !architecture_branch_subbranches.0[product_name_idx]
-                                .branches
-                                .as_ref()
-                                .unwrap()
-                                .0
-                                .iter()
-                                .any(|b| b.name == product_version)
-                            {
-                                subbranch.name = full_version.to_string();
-                                subbranch.product = Some(product.clone());
-
-                                architecture_branch_subbranches.0[product_name_idx]
-                                    .branches
-                                    .as_mut()
-                                    .unwrap()
-                                    .0
-                                    .push(subbranch);
-                            }
-                        }
-                    }
-                });
-        }
-    });
+    let new_branches = rebuild_product_tree_branches(branches);
 
     csaf.product_tree.as_mut().unwrap().branches = Some(BranchesT(new_branches));
 
@@ -328,6 +230,139 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
     Ok(())
 }
 
+/// Rebuilds the product tree branches emitted by SecObserve (one
+/// `ProductFamily` branch per product, with `ProductVersion` children) into a
+/// vendor -> architecture -> product name -> product version hierarchy.
+/// Non-`ProductFamily` branches are kept as they are.
+///
+/// Product versions usually follow the Stackable naming scheme, e.g.
+/// `airflow:2.9.3-stackable25.3.0-arm64`. Some shipped images keep their
+/// upstream version without a `-stackable<sdp-version>` part, e.g.
+/// `git-sync:v4.6.0-arm64`; those are grouped in the same way. A product
+/// version that matches neither pattern is dropped from the tree with a
+/// warning. Its relationships survive, so the CSAF validator fails the
+/// publication with test 6.1.1 instead of silently publishing an advisory
+/// with incomplete product coverage.
+fn rebuild_product_tree_branches(branches: Vec<Branch>) -> Vec<Branch> {
+    let stackable_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>((?P<product_version>.+)\-stackable)?(?P<sdp_version>\d+\.\d+\.\d+(\-dev)?)(\-(?P<architecture>arm64|amd64)?))$").unwrap();
+    let upstream_product_version_regex = Regex::new(r"^(?P<product_name>[a-zA-Z0-9\-_]+):(?P<full_version>(?P<product_version>.+?)\-(?P<architecture>arm64|amd64))$").unwrap();
+
+    let (sdp_branches, mut new_branches): (Vec<_>, Vec<_>) = branches
+        .into_iter()
+        .partition(|branch| matches!(branch.category, BranchCategory::ProductFamily));
+
+    new_branches.insert(
+        0,
+        Branch {
+            name: "Stackable".to_string(),
+            category: BranchCategory::Vendor,
+            product: None,
+            branches: Some(BranchesT(vec![])),
+        },
+    );
+
+    // Group products by architecture and product name
+    sdp_branches.into_iter().for_each(|branch| {
+        if let Some(subbranches) = branch.branches {
+            subbranches
+                .0
+                .into_iter()
+                // Loop over all product versions of the product family
+                .filter(|subbranch| matches!(subbranch.category, BranchCategory::ProductVersion))
+                .for_each(|mut subbranch| {
+                    // Subbranch has a product
+                    if let Some(product) = subbranch.product.as_ref() {
+                        // That product has a name that matches one of the product version patterns
+                        let captures = stackable_product_version_regex
+                            .captures(&product.name)
+                            .or_else(|| upstream_product_version_regex.captures(&product.name));
+                        if let Some(captures) = captures {
+                            let product_name = captures.name("product_name").unwrap().as_str();
+                            let full_version = captures.name("full_version").unwrap().as_str();
+                            let product_version = captures
+                                .name("product_version")
+                                .or_else(|| captures.name("sdp_version"))
+                                .unwrap()
+                                .as_str();
+
+                            let product_architecture =
+                                captures.name("architecture").map(|v| v.as_str()).unwrap();
+
+                            let stackable_architecture_branches =
+                                new_branches[0].branches.as_mut().unwrap();
+
+                            // Find architecture branch in stackable_branches or create it
+                            let architecture_idx = stackable_architecture_branches
+                                .0
+                                .iter()
+                                .position(|b| b.name == product_architecture)
+                                .unwrap_or_else(|| {
+                                    let idx = stackable_architecture_branches.0.len();
+                                    stackable_architecture_branches.0.push(Branch {
+                                        name: product_architecture.to_string(),
+                                        category: BranchCategory::Architecture,
+                                        product: None,
+                                        branches: Some(BranchesT(vec![])),
+                                    });
+                                    idx
+                                });
+
+                            let architecture_branch_subbranches = stackable_architecture_branches.0
+                                [architecture_idx]
+                                .branches
+                                .as_mut()
+                                .unwrap();
+
+                            // Find product_name branch in architecture branch or create it
+                            let product_name_idx = architecture_branch_subbranches
+                                .0
+                                .iter()
+                                .position(|b| b.name == product_name)
+                                .unwrap_or_else(|| {
+                                    let idx = architecture_branch_subbranches.0.len();
+
+                                    architecture_branch_subbranches.0.push(Branch {
+                                        name: product_name.to_string(),
+                                        category: BranchCategory::ProductName,
+                                        product: None,
+                                        branches: Some(BranchesT(vec![])),
+                                    });
+                                    idx
+                                });
+
+                            // Append product version branch to product_name branch if it does not exist
+                            if !architecture_branch_subbranches.0[product_name_idx]
+                                .branches
+                                .as_ref()
+                                .unwrap()
+                                .0
+                                .iter()
+                                .any(|b| b.name == product_version)
+                            {
+                                subbranch.name = full_version.to_string();
+                                subbranch.product = Some(product.clone());
+
+                                architecture_branch_subbranches.0[product_name_idx]
+                                    .branches
+                                    .as_mut()
+                                    .unwrap()
+                                    .0
+                                    .push(subbranch);
+                            }
+                        } else {
+                            eprintln!(
+                                "warning: product {:?} matches no known product version pattern, dropping it from the product tree",
+                                product.name
+                            );
+                        }
+                    }
+                });
+        }
+    });
+
+    new_branches
+}
+
 /// Removes `cpe` entries and empty `purl` entries from every
 /// `product_identification_helper` in a CSAF document.
 ///
@@ -448,8 +483,96 @@ fn generate_index_html(directory: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_filename, sanitize_product_identification_helpers, upsert_line};
+    use super::{
+        rebuild_product_tree_branches, sanitize_filename, sanitize_product_identification_helpers,
+        upsert_line,
+    };
+    use csaf::definitions::{Branch, BranchCategory, BranchesT, FullProductName, ProductIdT};
     use serde_json::json;
+
+    fn product_family(name: &str, version_names: &[&str]) -> Branch {
+        Branch {
+            name: name.to_string(),
+            category: BranchCategory::ProductFamily,
+            product: None,
+            branches: Some(BranchesT(
+                version_names
+                    .iter()
+                    .map(|version_name| Branch {
+                        name: version_name.to_string(),
+                        category: BranchCategory::ProductVersion,
+                        product: Some(FullProductName {
+                            name: version_name.to_string(),
+                            product_id: ProductIdT(version_name.to_string()),
+                            product_identification_helper: None,
+                        }),
+                        branches: None,
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Collects the product ids of all products in the given branches.
+    fn product_ids(branches: &[Branch]) -> Vec<String> {
+        let mut ids = vec![];
+        for branch in branches {
+            if let Some(product) = &branch.product {
+                ids.push(product.product_id.0.clone());
+            }
+            if let Some(subbranches) = &branch.branches {
+                ids.extend(product_ids(&subbranches.0));
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn rebuilds_stackable_and_upstream_versioned_products() {
+        let branches = vec![
+            product_family(
+                "airflow",
+                &[
+                    "airflow:2.9.3-stackable25.3.0-arm64",
+                    "airflow:2.9.3-stackable25.3.0-amd64",
+                ],
+            ),
+            product_family(
+                "git-sync",
+                &["git-sync:v4.6.0-arm64", "git-sync:v4.5.1-amd64"],
+            ),
+            product_family("unparseable", &["unparseable-without-version-or-arch"]),
+        ];
+
+        let new_branches = rebuild_product_tree_branches(branches);
+
+        // A single vendor branch containing everything
+        assert_eq!(new_branches.len(), 1);
+        assert_eq!(new_branches[0].name, "Stackable");
+        assert!(matches!(new_branches[0].category, BranchCategory::Vendor));
+
+        let architecture_names: Vec<_> = new_branches[0]
+            .branches
+            .as_ref()
+            .expect("vendor branch must have subbranches")
+            .0
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect();
+        assert_eq!(architecture_names, ["arm64", "amd64"]);
+
+        // All parseable products are kept, the unparseable one is dropped
+        assert_eq!(
+            product_ids(&new_branches),
+            [
+                "airflow:2.9.3-stackable25.3.0-amd64",
+                "airflow:2.9.3-stackable25.3.0-arm64",
+                "git-sync:v4.5.1-amd64",
+                "git-sync:v4.6.0-arm64",
+            ]
+        );
+    }
 
     #[test]
     fn sanitizes_tracking_ids_to_filenames() {
