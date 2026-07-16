@@ -15,23 +15,57 @@ use csaf::{
 };
 use regex::Regex;
 
+const SECOBSERVE_API_BASE: &str = "https://secobserve-backend.stackable.tech/api";
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
     let secobserve_api_token =
         env::var("SECOBSERVE_API_TOKEN").context("Missing SecObserve API token!")?;
 
-    // Collect command-line arguments for vulnerability names
-    let vulnerability_names: Vec<String> = env::args().skip(1).collect();
-    if vulnerability_names.is_empty() {
-        bail!("no vulnerability names given");
+    // The TLP label (https://www.first.org/tlp/) controls how the published
+    // documents may be distributed, e.g. WHITE for the public advisories and
+    // AMBER for the customer-only advisories.
+    let tlp_label = env::var("TLP_LABEL").unwrap_or_else(|_| "WHITE".to_string());
+    if !["WHITE", "GREEN", "AMBER", "RED"].contains(&tlp_label.as_str()) {
+        bail!("invalid TLP label {tlp_label:?}, expected WHITE, GREEN, AMBER or RED");
     }
 
-    // One CSAF document per vulnerability, so that the filename can be derived
-    // from the vulnerability id (CSAF requirement 11: the filename must be the
-    // document tracking id in lowercase).
-    for vulnerability_name in &vulnerability_names {
-        publish_advisory(vulnerability_name, &secobserve_api_token)?;
+    // The first argument selects the publishing mode, the remaining arguments
+    // are the documents to publish (one CSAF document per argument, so that
+    // the filename can be derived from the document tracking id).
+    let mut arguments = env::args().skip(1);
+    let mode = arguments
+        .next()
+        .context("no mode given, expected \"cve\" or \"product-version\"")?;
+    let names: Vec<String> = arguments.collect();
+    if names.is_empty() {
+        bail!("no names given after mode {mode:?}");
+    }
+
+    match mode.as_str() {
+        "cve" => {
+            for vulnerability_name in &names {
+                publish_vulnerability_advisory(
+                    vulnerability_name,
+                    &secobserve_api_token,
+                    &tlp_label,
+                )?;
+            }
+        }
+        "product-version" => {
+            // Product versions are given as `<product>:<branch>`, matching the
+            // product ids used in the CSAF documents,
+            // e.g. `airflow:3.1.6-stackable26.3.0-amd64`.
+            for product_version in &names {
+                publish_product_version_advisory(
+                    product_version,
+                    &secobserve_api_token,
+                    &tlp_label,
+                )?;
+            }
+        }
+        _ => bail!("unknown mode {mode:?}, expected \"cve\" or \"product-version\""),
     }
 
     // Generate directory listings
@@ -43,11 +77,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Result<()> {
+fn publish_vulnerability_advisory(
+    vulnerability_name: &str,
+    secobserve_api_token: &str,
+    tlp_label: &str,
+) -> Result<()> {
     // Retrieve CSAF document from SecObserve API
     let client = reqwest::blocking::Client::new();
     let response = client
-        .post("https://secobserve-backend.stackable.tech/api/vex/csaf_document/create/")
+        .post(format!("{SECOBSERVE_API_BASE}/vex/csaf_document/create/"))
         .json(&serde_json::json!({
             "vulnerability_names": &[vulnerability_name],
             "document_id_prefix": "STACKSA",
@@ -56,7 +94,7 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
             "publisher_category": "vendor",
             "publisher_namespace": "https://www.stackable.tech",
             "tracking_status": "final",
-            "tlp_label": "WHITE"
+            "tlp_label": tlp_label
         }))
         .header(
             "Authorization",
@@ -74,23 +112,139 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
         bail!("SecObserve returned {status} for vulnerability {vulnerability_name:?}: {body}");
     }
 
+    // The document tracking id is the vulnerability id, so that the filename
+    // (the lowercased tracking id) is stable across republications and an
+    // existing advisory can be updated in place.
+    publish_csaf_document(&body, vulnerability_name, tlp_label)
+}
+
+/// Publishes a VEX document containing all vulnerability statements for a
+/// single product version, given as `<product>:<branch>` with the SecObserve
+/// product and branch names, e.g. `airflow:3.1.6-stackable26.3.0-amd64`.
+fn publish_product_version_advisory(
+    product_version: &str,
+    secobserve_api_token: &str,
+    tlp_label: &str,
+) -> Result<()> {
+    let (product_name, branch_name) = product_version.split_once(':').context(format!(
+        "invalid product version {product_version:?}, expected <product>:<branch>, e.g. airflow:3.1.6-stackable26.3.0-amd64"
+    ))?;
+
+    let product_id = find_product_id(product_name, secobserve_api_token)?;
+
+    // Retrieve CSAF document from SecObserve API. Restricting the document to
+    // the given branch limits it to a single product version.
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!("{SECOBSERVE_API_BASE}/vex/csaf_document/create/"))
+        .json(&serde_json::json!({
+            "product": product_id,
+            "branch_names": &[branch_name],
+            "document_id_prefix": "STACKSA",
+            "title": format!("Stackable Security Advisory for: {}", product_version),
+            "publisher_name": "Stackable GmbH",
+            "publisher_category": "vendor",
+            "publisher_namespace": "https://www.stackable.tech",
+            "tracking_status": "final",
+            "tlp_label": tlp_label
+        }))
+        .header(
+            "Authorization",
+            format!("APIToken {}", secobserve_api_token),
+        )
+        .header("User-Agent", "Stackable Security Advisory Generator")
+        .send()?;
+
+    let status = response.status();
+    // SecObserve returns 204 when there are no vulnerability statements for
+    // the given product version, which would produce an empty VEX document.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        bail!(
+            "SecObserve returned no vulnerability statements for product version {product_version:?}"
+        );
+    }
+    let body = response.text()?;
+    if !status.is_success() {
+        bail!("SecObserve returned {status} for product version {product_version:?}: {body}");
+    }
+
+    // The document tracking id is derived from the product version, so that
+    // the filename is stable across republications and an existing advisory
+    // can be updated in place. The `:` separator is replaced by `-` to keep
+    // the tracking id readable.
+    let tracking_id = format!("{}-{}", product_name, branch_name);
+    publish_csaf_document(&body, &tracking_id, tlp_label)
+}
+
+/// Looks up the SecObserve product id for the given product name.
+fn find_product_id(product_name: &str, secobserve_api_token: &str) -> Result<u64> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(format!("{SECOBSERVE_API_BASE}/products/"))
+        .query(&[("name", product_name)])
+        .header(
+            "Authorization",
+            format!("APIToken {}", secobserve_api_token),
+        )
+        .header("User-Agent", "Stackable Security Advisory Generator")
+        .send()?;
+
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        bail!("SecObserve returned {status} when looking up product {product_name:?}: {body}");
+    }
+
+    // The `name` filter matches substrings, so search the results for an
+    // exact match.
+    let products: serde_json::Value = serde_json::from_str(&body)?;
+    products
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .context("missing results in product list")?
+        .iter()
+        .find(|product| {
+            product.get("name").and_then(serde_json::Value::as_str) == Some(product_name)
+        })
+        .and_then(|product| product.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        .context(format!(
+            "product {product_name:?} does not exist in SecObserve"
+        ))
+}
+
+/// Applies the Stackable customizations to a CSAF document returned by
+/// SecObserve and writes it to the advisory directory structure, together with
+/// its PGP signature and hashes. The document tracking id determines the
+/// filename (the lowercased tracking id), so it must be stable across republications:
+/// an already published document is updated in place, keeping its initial release
+/// date and revision history.
+fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Result<()> {
     // Parse CSAF document from response. SecObserve can emit a `cpe` in the
     // product identification helper (often an empty string or a CPE 2.3 formatted
     // string). The `csaf` crate parses `cpe` via the `cpe` crate, which only
     // understands the CPE 2.2 URI binding and rejects everything else with
     // "invalid prefix". We do not use `cpe` downstream, so strip it before parsing.
-    let mut csaf_value: serde_json::Value = serde_json::from_str(&body)?;
+    let mut csaf_value: serde_json::Value = serde_json::from_str(body)?;
     sanitize_product_identification_helpers(&mut csaf_value);
     let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
     csaf.document.lang = Some("en-US".to_string());
     csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
     csaf.document.publisher.contact_details = Some("product-security@stackable.tech".to_string());
+    // Documents that may be distributed without restriction (TLP:WHITE) are
+    // published under CC BY 4.0. Documents with a more restrictive TLP label
+    // must not be redistributed beyond what the label permits, so an open
+    // license would contradict the label.
+    let terms_of_use = match tlp_label {
+        "WHITE" => "This content is licensed under the Creative Commons Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/). If you distribute this content, or a modified version of it, you must provide attribution to Stackable GmbH and provide a link to the original.".to_string(),
+        _ => format!("This content is provided to customers of Stackable GmbH and is classified as TLP:{tlp_label} according to the Traffic Light Protocol (https://www.first.org/tlp/). It may only be shared as permitted by this TLP label."),
+    };
     let disclaimer = Note {
         category: csaf::definitions::NoteCategory::LegalDisclaimer,
-        text: "This content is licensed under the Creative Commons Attribution 4.0 International License (https://creativecommons.org/licenses/by/4.0/). If you distribute this content, or a modified version of it, you must provide attribution to Stackable GmbH and provide a link to the original.".to_string(),
+        text: terms_of_use,
         title: Some("Terms of Use".to_string()),
-        audience: None
+        audience: None,
     };
     csaf.document.notes = Some(vec![disclaimer]);
 
@@ -108,15 +262,12 @@ fn publish_advisory(vulnerability_name: &str, secobserve_api_token: &str) -> Res
 
     csaf.product_tree.as_mut().unwrap().branches = Some(BranchesT(new_branches));
 
-    // The document tracking id is the vulnerability id, so that the filename
-    // (the lowercased tracking id, see CSAF requirement 11) is stable across
-    // republications and an existing advisory can be updated in place.
-    csaf.document.tracking.id = vulnerability_name.to_string();
-    let filename = format!("{}.json", sanitize_filename(vulnerability_name));
+    csaf.document.tracking.id = tracking_id.to_string();
+    let filename = format!("{}.json", sanitize_filename(tracking_id));
 
     // If an advisory for this vulnerability was already published, update it in
     // place: keep its location (the year directory of the initial release, see
-    // CSAF requirement 12), its initial release date and its revision history.
+    // CSAF requirement 11), its initial release date and its revision history.
     let csaf_filename = match find_existing_advisory(&filename)? {
         Some(existing_csaf_filename) => {
             let existing_csaf: serde_json::Value =
@@ -396,8 +547,7 @@ fn sanitize_product_identification_helpers(value: &mut serde_json::Value) {
 }
 
 /// Converts a document tracking id into the corresponding CSAF filename
-/// (without the `.json` suffix), as defined by CSAF requirement 11: lowercase,
-/// with everything outside of `[+\-a-z0-9]` replaced by underscores.
+/// (without the `.json` suffix)
 fn sanitize_filename(tracking_id: &str) -> String {
     let mut filename = String::new();
     for character in tracking_id.to_lowercase().chars() {
