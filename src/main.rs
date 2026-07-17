@@ -68,11 +68,16 @@ fn main() -> Result<()> {
         _ => bail!("unknown mode {mode:?}, expected \"cve\" or \"product-version\""),
     }
 
-    // Generate directory listings
+    // Generate directory listings. The base path is the site-root-relative URL
+    // of the advisory directory (e.g. `/by-cve/csaf/v2/advisories`), used to
+    // build path-absolute hrefs so links resolve regardless of whether the
+    // requested directory URL carries a trailing slash. When unset the links
+    // fall back to relative paths.
+    let base_path = env::var("ADVISORY_BASE_PATH").ok();
     for year_directory in year_directories()? {
-        generate_index_html(&year_directory)?;
+        generate_index_html(&year_directory, base_path.as_deref())?;
     }
-    generate_index_html(".")?;
+    generate_index_html(".", base_path.as_deref())?;
 
     Ok(())
 }
@@ -608,7 +613,7 @@ fn upsert_line(filename: &str, line: &str, match_prefix: &str) -> Result<()> {
     Ok(())
 }
 
-fn generate_index_html(directory: &str) -> Result<()> {
+fn generate_index_html(directory: &str, base_path: Option<&str>) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(directory)?.filter_map(Result::ok).collect();
     entries.sort_by_key(|entry| entry.file_name());
 
@@ -618,10 +623,9 @@ fn generate_index_html(directory: &str) -> Result<()> {
     for entry in entries {
         let entry_name = entry.file_name().into_string().unwrap();
         if entry_name != "index.html" {
-            index_content.push_str(&format!(
-                "<li><a href=\"{}\">{}</a></li>",
-                entry_name, entry_name
-            ));
+            let is_directory = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let href = build_href(directory, &entry_name, is_directory, base_path);
+            index_content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", href, entry_name));
         }
     }
 
@@ -631,11 +635,36 @@ fn generate_index_html(directory: &str) -> Result<()> {
     Ok(())
 }
 
+/// Builds the href for a directory listing entry. When `base_path` is set, the
+/// href is path-absolute (e.g. `/by-cve/csaf/v2/advisories/2026/`) so it
+/// resolves independently of the request URL's trailing slash; directory
+/// entries additionally get a trailing slash. Without `base_path` the href
+/// stays relative to the current directory.
+fn build_href(
+    directory: &str,
+    entry_name: &str,
+    is_directory: bool,
+    base_path: Option<&str>,
+) -> String {
+    let trailing_slash = if is_directory { "/" } else { "" };
+    match base_path {
+        Some(base) => {
+            let base = base.trim_end_matches('/');
+            let subdirectory = match directory.trim_start_matches("./").trim_matches('/') {
+                "" | "." => String::new(),
+                subdirectory => format!("/{subdirectory}"),
+            };
+            format!("{base}{subdirectory}/{entry_name}{trailing_slash}")
+        }
+        None => format!("{entry_name}{trailing_slash}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        rebuild_product_tree_branches, sanitize_filename, sanitize_product_identification_helpers,
-        upsert_line,
+        build_href, rebuild_product_tree_branches, sanitize_filename,
+        sanitize_product_identification_helpers, upsert_line,
     };
     use csaf::definitions::{Branch, BranchCategory, BranchesT, FullProductName, ProductIdT};
     use serde_json::json;
@@ -794,5 +823,45 @@ mod tests {
             &value["product_tree"]["branches"][1]["product"]["product_identification_helper"];
         assert!(second.get("cpe").is_none());
         assert!(second.get("purl").is_none());
+    }
+
+    #[test]
+    fn build_href_absolute_from_root_directory() {
+        let base = Some("/by-cve/csaf/v2/advisories");
+        assert_eq!(
+            build_href(".", "2026", true, base),
+            "/by-cve/csaf/v2/advisories/2026/"
+        );
+        assert_eq!(
+            build_href(".", "index.txt", false, base),
+            "/by-cve/csaf/v2/advisories/index.txt"
+        );
+    }
+
+    #[test]
+    fn build_href_absolute_from_year_directory() {
+        let base = Some("/by-cve/csaf/v2/advisories");
+        assert_eq!(
+            build_href("2026", "cve-2026-6100.json", false, base),
+            "/by-cve/csaf/v2/advisories/2026/cve-2026-6100.json"
+        );
+    }
+
+    #[test]
+    fn build_href_trims_redundant_slashes_in_base() {
+        let base = Some("/by-cve/csaf/v2/advisories/");
+        assert_eq!(
+            build_href("./2026", "index.html", false, base),
+            "/by-cve/csaf/v2/advisories/2026/index.html"
+        );
+    }
+
+    #[test]
+    fn build_href_relative_without_base_path() {
+        assert_eq!(build_href(".", "2026", true, None), "2026/");
+        assert_eq!(
+            build_href("2026", "cve-2026-6100.json", false, None),
+            "cve-2026-6100.json"
+        );
     }
 }
