@@ -319,7 +319,7 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
         .arg(format!(
             "{}/{}",
             env::current_dir()?.to_string_lossy(),
-            &csaf_filename
+            csaf_filename
         ))
         .output()?;
     if !validator_result.status.success() {
