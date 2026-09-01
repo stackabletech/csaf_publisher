@@ -44,4 +44,4 @@ jobs:
         name: Sign the published image
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: cosign sign -y oci.stackable.tech/stackable/csaf_publisher@"$DIGEST"
+        run: cosign sign -y "oci.stackable.tech/stackable/csaf_publisher@$DIGEST"
