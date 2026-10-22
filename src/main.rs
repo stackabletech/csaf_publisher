@@ -17,6 +17,14 @@ use regex::Regex;
 
 const SECOBSERVE_API_BASE: &str = "https://secobserve-backend.stackable.tech/api";
 
+// The publisher must match the publisher in the provider-metadata.json of the
+// advisories and protected-advisories repositories. The namespace carries a
+// trailing slash, because the csaf crate parses it as a URL and serializes it
+// with one, so this is what ends up in the published documents.
+const PUBLISHER_NAME: &str = "Stackable Product Security Team";
+const PUBLISHER_NAMESPACE: &str = "https://www.stackable.tech/";
+const PUBLISHER_ISSUING_AUTHORITY: &str = "The Stackable Product Security Team is responsible for vulnerability handling across all Stackable offerings.";
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -95,9 +103,9 @@ fn publish_vulnerability_advisory(
             "vulnerability_names": &[vulnerability_name],
             "document_id_prefix": "STACKSA",
             "title": format!("Stackable Security Advisory for: {}", vulnerability_name),
-            "publisher_name": "Stackable GmbH",
+            "publisher_name": PUBLISHER_NAME,
             "publisher_category": "vendor",
-            "publisher_namespace": "https://www.stackable.tech",
+            "publisher_namespace": PUBLISHER_NAMESPACE,
             "tracking_status": "final",
             "tlp_label": tlp_label
         }))
@@ -147,9 +155,9 @@ fn publish_product_version_advisory(
             "branch_names": &[branch_name],
             "document_id_prefix": "STACKSA",
             "title": format!("Stackable Security Advisory for: {}", product_version),
-            "publisher_name": "Stackable GmbH",
+            "publisher_name": PUBLISHER_NAME,
             "publisher_category": "vendor",
-            "publisher_namespace": "https://www.stackable.tech",
+            "publisher_namespace": PUBLISHER_NAMESPACE,
             "tracking_status": "final",
             "tlp_label": tlp_label
         }))
@@ -235,7 +243,7 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
     let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
     csaf.document.lang = Some("en-US".to_string());
-    csaf.document.publisher.issuing_authority = Some("The Stackable Security Team is responsible for vulnerability handling across all Stackable offerings.".to_string());
+    csaf.document.publisher.issuing_authority = Some(PUBLISHER_ISSUING_AUTHORITY.to_string());
     csaf.document.publisher.contact_details = Some("product-security@stackable.tech".to_string());
     // Documents that may be distributed without restriction (TLP:WHITE) are
     // published under CC BY 4.0. Documents with a more restrictive TLP label
