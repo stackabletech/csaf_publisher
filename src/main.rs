@@ -181,12 +181,137 @@ fn publish_product_version_advisory(
         bail!("SecObserve returned {status} for product version {product_version:?}: {body}");
     }
 
+    // Make the statements match the packages that scanners report for the image,
+    // see the functions for details. This is only done for product version
+    // documents, as they cover a single image, so a component is never ambiguous.
+    let mut csaf_value: serde_json::Value = serde_json::from_str(&body)?;
+    replace_relationships_with_components(&mut csaf_value);
+    normalize_purls(&mut csaf_value);
+
     // The document tracking id is derived from the product version, so that
     // the filename is stable across republications and an existing advisory
     // can be updated in place. The `:` separator is replaced by `-` to keep
     // the tracking id readable.
     let tracking_id = format!("{}-{}", product_name, branch_name);
-    publish_csaf_document(&body, &tracking_id, tlp_label)
+    publish_csaf_document(&csaf_value.to_string(), &tracking_id, tlp_label)
+}
+
+/// Removes the relationships from the product tree and replaces every
+/// reference to a relationship product id with the id of its component.
+///
+/// SecObserve states each vulnerability for a `default_component_of`
+/// relationship between the component (e.g. a Maven package) and the image.
+/// Trivy only applies such a statement when the component is a direct child of
+/// the image in its dependency graph, so statements for transitive packages
+/// (e.g. libcurl-minimal, which is pulled in by curl-minimal) or packages from
+/// SBOMs embedded in the image are ignored. Stating the vulnerability for the
+/// component itself works for all of them.
+fn replace_relationships_with_components(value: &mut serde_json::Value) {
+    let relationships = value
+        .get_mut("product_tree")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|product_tree| product_tree.remove("relationships"));
+    let Some(serde_json::Value::Array(relationships)) = relationships else {
+        return;
+    };
+
+    let components: std::collections::HashMap<String, String> = relationships
+        .iter()
+        .filter_map(|relationship| {
+            let relationship_id = relationship
+                .get("full_product_name")?
+                .get("product_id")?
+                .as_str()?;
+            let component_id = relationship.get("product_reference")?.as_str()?;
+            Some((relationship_id.to_string(), component_id.to_string()))
+        })
+        .collect();
+
+    replace_product_ids(value, &components);
+}
+
+/// Replaces all strings that are keys of `components` with their value. Arrays
+/// of strings are deduplicated afterwards, because several relationships can
+/// refer to the same component.
+fn replace_product_ids(
+    value: &mut serde_json::Value,
+    components: &std::collections::HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(string) => {
+            if let Some(component_id) = components.get(string.as_str()) {
+                *string = component_id.clone();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            items
+                .iter_mut()
+                .for_each(|item| replace_product_ids(item, components));
+            if items.iter().all(serde_json::Value::is_string) {
+                let mut seen = std::collections::HashSet::new();
+                items.retain(|item| seen.insert(item.as_str().unwrap_or_default().to_string()));
+            }
+        }
+        serde_json::Value::Object(map) => map
+            .values_mut()
+            .for_each(|nested| replace_product_ids(nested, components)),
+        _ => {}
+    }
+}
+
+/// Normalizes the purls in every `product_identification_helper`, so that they
+/// match the purls Trivy reports, see [`normalize_purl`].
+fn normalize_purls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(purl)) = map
+                .get_mut("product_identification_helper")
+                .and_then(|helper| helper.get_mut("purl"))
+            {
+                *purl = normalize_purl(purl);
+            }
+            map.values_mut().for_each(normalize_purls);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(normalize_purls),
+        _ => {}
+    }
+}
+
+/// Converts a purl as emitted by SecObserve into the form Trivy reports.
+///
+/// Trivy matches a purl only if all of its qualifiers are present in the
+/// package purl, so qualifiers that Trivy does not set must be dropped:
+///
+/// - RPM: SecObserve uses `distro=rhel-9.8` and an `upstream` qualifier,
+///   Trivy uses `distro=redhat-9.8` and no `upstream`.
+/// - Go standard library: SecObserve uses the version without the `v` prefix
+///   (`pkg:golang/stdlib@1.25.7`), Trivy with it (`@v1.25.7`).
+fn normalize_purl(purl: &str) -> String {
+    if purl.starts_with("pkg:rpm/") {
+        let Some((base, qualifiers)) = purl.split_once('?') else {
+            return purl.to_string();
+        };
+        let qualifiers: Vec<String> = qualifiers
+            .split('&')
+            .filter(|qualifier| !qualifier.starts_with("upstream="))
+            .map(|qualifier| match qualifier.strip_prefix("distro=rhel-") {
+                Some(version) => format!("distro=redhat-{version}"),
+                None => qualifier.to_string(),
+            })
+            .collect();
+        if qualifiers.is_empty() {
+            return base.to_string();
+        }
+        return format!("{base}?{}", qualifiers.join("&"));
+    }
+
+    if let Some(version) = purl.strip_prefix("pkg:golang/stdlib@") {
+        if version.starts_with(|c: char| c.is_ascii_digit()) {
+            return format!("pkg:golang/stdlib@v{version}");
+        }
+    }
+
+    purl.to_string()
 }
 
 /// Looks up the SecObserve product id for the given product name.
@@ -671,7 +796,8 @@ fn build_href(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_href, rebuild_product_tree_branches, sanitize_filename,
+        build_href, normalize_purl, normalize_purls, rebuild_product_tree_branches,
+        replace_relationships_with_components, sanitize_filename,
         sanitize_product_identification_helpers, upsert_line,
     };
     use csaf::definitions::{Branch, BranchCategory, BranchesT, FullProductName, ProductIdT};
@@ -831,6 +957,110 @@ mod tests {
             &value["product_tree"]["branches"][1]["product"]["product_identification_helper"];
         assert!(second.get("cpe").is_none());
         assert!(second.get("purl").is_none());
+    }
+
+    #[test]
+    fn replaces_relationships_with_components() {
+        let image = "pkg:oci/nifi@sha256%3Aabc?arch=amd64";
+        let curl = "pkg:rpm/redhat/curl-minimal@7.76.1-40.el9?arch=x86_64";
+        let libcurl = "pkg:rpm/redhat/libcurl-minimal@7.76.1-40.el9?arch=x86_64";
+        let curl_in_image = format!("{curl}@{image}");
+        let libcurl_in_image = format!("{libcurl}@{image}");
+        let mut value = json!({
+            "product_tree": {
+                "branches": [],
+                "relationships": [{
+                    "category": "default_component_of",
+                    "full_product_name": {"name": curl_in_image, "product_id": curl_in_image},
+                    "product_reference": curl,
+                    "relates_to_product_reference": image
+                }, {
+                    "category": "default_component_of",
+                    "full_product_name": {"name": libcurl_in_image, "product_id": libcurl_in_image},
+                    "product_reference": libcurl,
+                    "relates_to_product_reference": image
+                }]
+            },
+            "vulnerabilities": [{
+                "cve": "CVE-2024-7264",
+                "product_status": {"known_not_affected": [curl_in_image, libcurl_in_image, curl]},
+                "flags": [{"label": "vulnerable_code_not_in_execute_path", "product_ids": [curl_in_image]}],
+                "threats": [{"category": "impact", "details": curl_in_image, "product_ids": [libcurl_in_image]}]
+            }]
+        });
+
+        replace_relationships_with_components(&mut value);
+
+        assert!(value["product_tree"].get("relationships").is_none());
+        let vulnerability = &value["vulnerabilities"][0];
+        assert_eq!(
+            vulnerability["product_status"]["known_not_affected"],
+            json!([curl, libcurl])
+        );
+        assert_eq!(vulnerability["flags"][0]["product_ids"], json!([curl]));
+        assert_eq!(vulnerability["threats"][0]["product_ids"], json!([libcurl]));
+    }
+
+    #[test]
+    fn keeps_documents_without_relationships() {
+        let mut value = json!({
+            "product_tree": {"branches": []},
+            "vulnerabilities": [{"product_status": {"known_affected": ["a"]}}]
+        });
+        let expected = value.clone();
+
+        replace_relationships_with_components(&mut value);
+
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn normalizes_purls_to_trivy_form() {
+        assert_eq!(
+            normalize_purl("pkg:rpm/redhat/openssl-libs@3.5.5-4.el9_8?arch=x86_64&distro=rhel-9.8&epoch=1&upstream=openssl-3.5.5-4.el9_8.src.rpm"),
+            "pkg:rpm/redhat/openssl-libs@3.5.5-4.el9_8?arch=x86_64&distro=redhat-9.8&epoch=1"
+        );
+        assert_eq!(
+            normalize_purl("pkg:rpm/redhat/glib2@2.68.4?upstream=glib2.src.rpm"),
+            "pkg:rpm/redhat/glib2@2.68.4"
+        );
+        assert_eq!(
+            normalize_purl("pkg:golang/stdlib@1.25.7"),
+            "pkg:golang/stdlib@v1.25.7"
+        );
+        assert_eq!(
+            normalize_purl("pkg:golang/stdlib@v1.25.7"),
+            "pkg:golang/stdlib@v1.25.7"
+        );
+        assert_eq!(
+            normalize_purl("pkg:maven/io.netty/netty-codec-http@4.2.6.Final?type=jar"),
+            "pkg:maven/io.netty/netty-codec-http@4.2.6.Final?type=jar"
+        );
+    }
+
+    #[test]
+    fn normalizes_purls_only_in_identification_helpers() {
+        let rpm = "pkg:rpm/redhat/curl-minimal@7.76.1-40.el9?arch=x86_64&distro=rhel-9.8";
+        let mut value = json!({
+            "product_tree": {
+                "branches": [{
+                    "product": {
+                        "name": rpm,
+                        "product_id": rpm,
+                        "product_identification_helper": {"purl": rpm}
+                    }
+                }]
+            }
+        });
+
+        normalize_purls(&mut value);
+
+        let product = &value["product_tree"]["branches"][0]["product"];
+        assert_eq!(
+            product["product_identification_helper"]["purl"],
+            "pkg:rpm/redhat/curl-minimal@7.76.1-40.el9?arch=x86_64&distro=redhat-9.8"
+        );
+        assert_eq!(product["product_id"], rpm);
     }
 
     #[test]
