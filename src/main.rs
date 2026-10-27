@@ -365,6 +365,7 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
     // "invalid prefix". We do not use `cpe` downstream, so strip it before parsing.
     let mut csaf_value: serde_json::Value = serde_json::from_str(body)?;
     sanitize_product_identification_helpers(&mut csaf_value);
+    remove_conflicting_flags(&mut csaf_value);
     let mut csaf: Csaf = serde_json::from_value(csaf_value)?;
     // let mut csaf: Csaf = serde_json::from_reader(File::open("csaf_in.json")?)?;
     csaf.document.lang = Some("en-US".to_string());
@@ -684,6 +685,108 @@ fn sanitize_product_identification_helpers(value: &mut serde_json::Value) {
     }
 }
 
+/// VEX justification flag labels, from the strongest to the weakest statement.
+const FLAG_PRIORITY: [&str; 5] = [
+    "component_not_present",
+    "vulnerable_code_not_present",
+    "vulnerable_code_not_in_execute_path",
+    "vulnerable_code_cannot_be_controlled_by_adversary",
+    "inline_mitigations_already_exist",
+];
+
+/// Ensures that every product has at most one flag per vulnerability, as CSAF
+/// requires (mandatory test 6.1.33).
+///
+/// SecObserve has one observation per scanner (e.g. Grype and Trivy) for the
+/// same package and vulnerability. When those are assessed with different
+/// justifications, SecObserve emits one flag per justification for the same
+/// product. The product is kept in the flag with the strongest justification
+/// (see [`FLAG_PRIORITY`]) and removed from the others, with a warning so that
+/// the assessments can be aligned. The impact statements of all assessments
+/// are kept, as a product may have several threats.
+fn remove_conflicting_flags(value: &mut serde_json::Value) {
+    let Some(vulnerabilities) = value
+        .get_mut("vulnerabilities")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for vulnerability in vulnerabilities {
+        let vulnerability_name = vulnerability
+            .get("cve")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown vulnerability")
+            .to_string();
+        let Some(flags) = vulnerability
+            .get_mut("flags")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        // Visit the flags from the strongest to the weakest justification, unknown
+        // labels last. The sort is stable, so equal labels keep their order.
+        let flag_label = |flag: &serde_json::Value| {
+            flag.get("label")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mut flag_order: Vec<usize> = (0..flags.len()).collect();
+        flag_order.sort_by_key(|&index| {
+            let label = flag_label(&flags[index]);
+            FLAG_PRIORITY
+                .iter()
+                .position(|priority_label| *priority_label == label)
+                .unwrap_or(FLAG_PRIORITY.len())
+        });
+
+        let mut kept_labels: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for index in flag_order {
+            let label = flag_label(&flags[index]);
+            let Some(product_ids) = flags[index]
+                .get_mut("product_ids")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            product_ids.retain(|product_id| {
+                let Some(product_id) = product_id.as_str() else {
+                    return true;
+                };
+                match kept_labels.get(product_id) {
+                    Some(kept_label) => {
+                        eprintln!(
+                            "warning: {vulnerability_name}: product {product_id:?} has the flags {kept_label:?} and {label:?}, keeping {kept_label:?}"
+                        );
+                        false
+                    }
+                    None => {
+                        kept_labels.insert(product_id.to_string(), label.clone());
+                        true
+                    }
+                }
+            });
+        }
+
+        // Drop flags that no longer apply to any product or group
+        flags.retain(|flag| {
+            let has_products = flag
+                .get("product_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|product_ids| !product_ids.is_empty());
+            has_products || flag.get("group_ids").is_some()
+        });
+        if flags.is_empty() {
+            if let Some(vulnerability) = vulnerability.as_object_mut() {
+                vulnerability.remove("flags");
+            }
+        }
+    }
+}
+
 /// Converts a document tracking id into the corresponding CSAF filename
 /// (without the `.json` suffix)
 fn sanitize_filename(tracking_id: &str) -> String {
@@ -797,7 +900,7 @@ fn build_href(
 mod tests {
     use super::{
         build_href, normalize_purl, normalize_purls, rebuild_product_tree_branches,
-        replace_relationships_with_components, sanitize_filename,
+        remove_conflicting_flags, replace_relationships_with_components, sanitize_filename,
         sanitize_product_identification_helpers, upsert_line,
     };
     use csaf::definitions::{Branch, BranchCategory, BranchesT, FullProductName, ProductIdT};
@@ -1012,6 +1115,51 @@ mod tests {
         replace_relationships_with_components(&mut value);
 
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn keeps_only_the_strongest_flag_per_product() {
+        let mut value = json!({
+            "vulnerabilities": [{
+                "cve": "CVE-2026-31789",
+                "flags": [{
+                    "label": "vulnerable_code_not_in_execute_path",
+                    "product_ids": ["openssl", "openssl-libs", "curl"]
+                }, {
+                    "label": "vulnerable_code_not_present",
+                    "product_ids": ["openssl", "openssl-libs"]
+                }]
+            }, {
+                "cve": "CVE-2026-0001",
+                "flags": [{
+                    "label": "vulnerable_code_cannot_be_controlled_by_adversary",
+                    "product_ids": ["zlib"]
+                }, {
+                    "label": "component_not_present",
+                    "product_ids": ["zlib"]
+                }]
+            }]
+        });
+
+        remove_conflicting_flags(&mut value);
+
+        assert_eq!(
+            value["vulnerabilities"][0]["flags"],
+            json!([{
+                "label": "vulnerable_code_not_in_execute_path",
+                "product_ids": ["curl"]
+            }, {
+                "label": "vulnerable_code_not_present",
+                "product_ids": ["openssl", "openssl-libs"]
+            }])
+        );
+        assert_eq!(
+            value["vulnerabilities"][1]["flags"],
+            json!([{
+                "label": "component_not_present",
+                "product_ids": ["zlib"]
+            }])
+        );
     }
 
     #[test]
