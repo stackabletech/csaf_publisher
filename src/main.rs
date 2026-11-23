@@ -5,7 +5,7 @@ use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecre
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::Password;
 use sha2::{Digest, Sha256, Sha512};
-use std::{env, fs};
+use std::{collections::HashMap, env, fs};
 
 use chrono::{Datelike, SecondsFormat};
 use color_eyre::eyre::{bail, ContextCompat, Result};
@@ -39,26 +39,32 @@ fn main() -> Result<()> {
         bail!("invalid TLP label {tlp_label:?}, expected WHITE, GREEN, AMBER or RED");
     }
 
-    // The first argument selects the publishing mode, the remaining arguments
-    // are the documents to publish (one CSAF document per argument, so that
-    // the filename can be derived from the document tracking id).
+    // The first argument selects the mode, the remaining arguments are the
+    // documents to publish (one CSAF document per argument, so that the
+    // filename can be derived from the document tracking id), or the releases
+    // to list the product versions for.
     let mut arguments = env::args().skip(1);
-    let mode = arguments
-        .next()
-        .context("no mode given, expected \"cve\" or \"product-version\"")?;
+    let mode = arguments.next().context(
+        "no mode given, expected \"cve\", \"product-version\" or \"list-product-versions\"",
+    )?;
     let names: Vec<String> = arguments.collect();
     if names.is_empty() {
         bail!("no names given after mode {mode:?}");
     }
 
+    // Each argument is published on its own, so that a single failing document
+    // (e.g. a product name that does not exist in SecObserve) does not block
+    // the others. The failures are reported at the end.
+    let mut failures = vec![];
     match mode.as_str() {
         "cve" => {
             for vulnerability_name in &names {
-                publish_vulnerability_advisory(
+                let outcome = publish_vulnerability_advisory(
                     vulnerability_name,
                     &secobserve_api_token,
                     &tlp_label,
-                )?;
+                );
+                report_outcome(vulnerability_name, outcome, &mut failures);
             }
         }
         "product-version" => {
@@ -66,14 +72,26 @@ fn main() -> Result<()> {
             // product ids used in the CSAF documents,
             // e.g. `airflow:3.1.6-stackable26.3.0-amd64`.
             for product_version in &names {
-                publish_product_version_advisory(
+                let outcome = publish_product_version_advisory(
                     product_version,
                     &secobserve_api_token,
                     &tlp_label,
-                )?;
+                );
+                report_outcome(product_version, outcome, &mut failures);
             }
         }
-        _ => bail!("unknown mode {mode:?}, expected \"cve\" or \"product-version\""),
+        "list-product-versions" => {
+            // Prints the product versions of the given SDP releases as a
+            // comma-separated list, in the form the "product-version" mode
+            // expects. Nothing is published, so the advisory directory
+            // listings are left alone.
+            let product_versions = list_product_versions(&names, &secobserve_api_token)?;
+            println!("{}", product_versions.join(","));
+            return Ok(());
+        }
+        _ => bail!(
+            "unknown mode {mode:?}, expected \"cve\", \"product-version\" or \"list-product-versions\""
+        ),
     }
 
     // Generate directory listings. The base path is the site-root-relative URL
@@ -87,14 +105,53 @@ fn main() -> Result<()> {
     }
     generate_index_html(".", base_path.as_deref())?;
 
+    if !failures.is_empty() {
+        bail!(
+            "failed to publish {} of {} advisories: {}",
+            failures.len(),
+            names.len(),
+            failures.join(", ")
+        );
+    }
+
     Ok(())
+}
+
+/// The result of publishing a single advisory.
+enum PublishOutcome {
+    /// The advisory was published for the first time.
+    Created,
+    /// The content of the advisory changed, a new revision was published.
+    Updated,
+    /// The content of the advisory did not change, nothing was written.
+    Unchanged,
+    /// SecObserve has no vulnerability statements, so there is nothing to
+    /// publish.
+    NoStatements,
+}
+
+/// Prints the outcome of publishing the advisory `name` and records it in
+/// `failures` if publishing failed.
+fn report_outcome(name: &str, outcome: Result<PublishOutcome>, failures: &mut Vec<String>) {
+    match outcome {
+        Ok(PublishOutcome::Created) => println!("{name}: published new advisory"),
+        Ok(PublishOutcome::Updated) => println!("{name}: published new revision"),
+        Ok(PublishOutcome::Unchanged) => println!("{name}: unchanged"),
+        Ok(PublishOutcome::NoStatements) => {
+            println!("{name}: skipped, SecObserve has no vulnerability statements")
+        }
+        Err(error) => {
+            eprintln!("{name}: failed to publish: {error:?}");
+            failures.push(name.to_string());
+        }
+    }
 }
 
 fn publish_vulnerability_advisory(
     vulnerability_name: &str,
     secobserve_api_token: &str,
     tlp_label: &str,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     // Retrieve CSAF document from SecObserve API
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -138,7 +195,7 @@ fn publish_product_version_advisory(
     product_version: &str,
     secobserve_api_token: &str,
     tlp_label: &str,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     let (product_name, branch_name) = product_version.split_once(':').context(format!(
         "invalid product version {product_version:?}, expected <product>:<branch>, e.g. airflow:3.1.6-stackable26.3.0-amd64"
     ))?;
@@ -172,13 +229,26 @@ fn publish_product_version_advisory(
     // SecObserve returns 204 when there are no vulnerability statements for
     // the given product version, which would produce an empty VEX document.
     if status == reqwest::StatusCode::NO_CONTENT {
-        bail!(
-            "SecObserve returned no vulnerability statements for product version {product_version:?}"
-        );
+        return Ok(PublishOutcome::NoStatements);
     }
     let body = response.text()?;
     if !status.is_success() {
         bail!("SecObserve returned {status} for product version {product_version:?}: {body}");
+    }
+
+    // Every call of the create endpoint stores a new CSAF document in
+    // SecObserve. Product version advisories are republished regularly, so
+    // without cleaning up, SecObserve would accumulate a document per product
+    // version and run. The published advisory in the repository is the source of
+    // truth for the revision history, so the SecObserve copy is not needed.
+    // Failing to delete it only leaves a stale copy behind, which is no reason
+    // to fail publishing.
+    if let Err(error) =
+        delete_secobserve_csaf_document(&body, product_id, branch_name, secobserve_api_token)
+    {
+        eprintln!(
+            "{product_version}: failed to delete the CSAF document created in SecObserve: {error:?}"
+        );
     }
 
     // Make the statements match the packages that scanners report for the image,
@@ -316,30 +386,10 @@ fn normalize_purl(purl: &str) -> String {
 
 /// Looks up the SecObserve product id for the given product name.
 fn find_product_id(product_name: &str, secobserve_api_token: &str) -> Result<u64> {
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .get(format!("{SECOBSERVE_API_BASE}/products/"))
-        .query(&[("name", product_name)])
-        .header(
-            "Authorization",
-            format!("APIToken {}", secobserve_api_token),
-        )
-        .header("User-Agent", "Stackable Security Advisory Generator")
-        .send()?;
-
-    let status = response.status();
-    let body = response.text()?;
-    if !status.is_success() {
-        bail!("SecObserve returned {status} when looking up product {product_name:?}: {body}");
-    }
-
     // The `name` filter matches substrings, so search the results for an
-    // exact match.
-    let products: serde_json::Value = serde_json::from_str(&body)?;
-    products
-        .get("results")
-        .and_then(serde_json::Value::as_array)
-        .context("missing results in product list")?
+    // exact match. All pages are retrieved, as short names like `opa` match
+    // many products.
+    secobserve_list("products/", &[("name", product_name)], secobserve_api_token)?
         .iter()
         .find(|product| {
             product.get("name").and_then(serde_json::Value::as_str) == Some(product_name)
@@ -351,13 +401,172 @@ fn find_product_id(product_name: &str, secobserve_api_token: &str) -> Result<u64
         ))
 }
 
+/// Retrieves all results of a paginated SecObserve list endpoint, e.g.
+/// `products/`.
+fn secobserve_list(
+    path: &str,
+    query: &[(&str, &str)],
+    secobserve_api_token: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let client = reqwest::blocking::Client::new();
+    let mut results = vec![];
+    // Pages are requested by number instead of following the `next` links,
+    // because SecObserve builds those from the request it received, so behind
+    // a TLS terminating proxy they can point to plain HTTP.
+    for page in 1.. {
+        let page = page.to_string();
+        let response = client
+            .get(format!("{SECOBSERVE_API_BASE}/{path}"))
+            .query(query)
+            .query(&[("page", page.as_str()), ("page_size", "1000")])
+            .header(
+                "Authorization",
+                format!("APIToken {}", secobserve_api_token),
+            )
+            .header("User-Agent", "Stackable Security Advisory Generator")
+            .send()?;
+
+        let status = response.status();
+        let body = response.text()?;
+        if !status.is_success() {
+            bail!("SecObserve returned {status} when listing {path:?} (page {page}): {body}");
+        }
+
+        let mut list: serde_json::Value = serde_json::from_str(&body)?;
+        results.append(
+            list.get_mut("results")
+                .and_then(serde_json::Value::as_array_mut)
+                .context(format!("missing results in list of {path:?}"))?,
+        );
+        if list.get("next").is_none_or(serde_json::Value::is_null) {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+/// Deletes the CSAF document that SecObserve stored when its create endpoint
+/// returned `body` for the given product and branch.
+fn delete_secobserve_csaf_document(
+    body: &str,
+    product_id: u64,
+    branch_name: &str,
+    secobserve_api_token: &str,
+) -> Result<()> {
+    // SecObserve tracking ids are `<prefix>_<base id>_<version>`, with a base id
+    // of `<year>_<counter>`, e.g. `STACKSA_2026_0123_0001`.
+    let document: serde_json::Value = serde_json::from_str(body)?;
+    let tracking_id = document
+        .pointer("/document/tracking/id")
+        .and_then(serde_json::Value::as_str)
+        .context("missing tracking id in CSAF document")?;
+    let (document_id_prefix, document_base_id) = tracking_id
+        .rsplit_once('_')
+        .and_then(|(prefix_and_base_id, _version)| prefix_and_base_id.split_once('_'))
+        .context(format!("unexpected SecObserve tracking id {tracking_id:?}"))?;
+
+    // The list endpoint has no filter for the base id, so narrow the list down
+    // as far as possible and search the results.
+    let product_id = product_id.to_string();
+    let csaf_id = secobserve_list(
+        "vex/csaf/",
+        &[
+            ("product", product_id.as_str()),
+            ("document_id_prefix", document_id_prefix),
+            ("branches__branch__name", branch_name),
+        ],
+        secobserve_api_token,
+    )?
+    .iter()
+    .find(|csaf| {
+        csaf.get("document_base_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(document_base_id)
+    })
+    .and_then(|csaf| csaf.get("id"))
+    .and_then(serde_json::Value::as_u64)
+    .context(format!(
+        "CSAF document {tracking_id:?} not found in SecObserve"
+    ))?;
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .delete(format!("{SECOBSERVE_API_BASE}/vex/csaf/{csaf_id}/"))
+        .header(
+            "Authorization",
+            format!("APIToken {}", secobserve_api_token),
+        )
+        .header("User-Agent", "Stackable Security Advisory Generator")
+        .send()?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text()?;
+        bail!("SecObserve returned {status} when deleting CSAF document {tracking_id:?}: {body}");
+    }
+    Ok(())
+}
+
+/// Lists the product versions of the given SDP releases (e.g. `26.7.0`) that
+/// exist as branches in SecObserve, as sorted `<product>:<branch>` strings.
+fn list_product_versions(releases: &[String], secobserve_api_token: &str) -> Result<Vec<String>> {
+    let pattern = product_version_branch_pattern(releases)?;
+
+    let product_names: HashMap<u64, String> =
+        secobserve_list("products/", &[], secobserve_api_token)?
+            .iter()
+            .filter_map(|product| {
+                Some((
+                    product.get("id")?.as_u64()?,
+                    product.get("name")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+
+    let mut product_versions: Vec<String> =
+        secobserve_list("branches/", &[], secobserve_api_token)?
+            .iter()
+            .filter_map(|branch| {
+                let branch_name = branch.get("name")?.as_str()?;
+                if !pattern.is_match(branch_name) {
+                    return None;
+                }
+                let product_name = product_names.get(&branch.get("product")?.as_u64()?)?;
+                Some(format!("{product_name}:{branch_name}"))
+            })
+            .collect();
+    product_versions.sort();
+    product_versions.dedup();
+    Ok(product_versions)
+}
+
+/// Matches the SecObserve branch names of the images of the given releases:
+/// `<product version>-stackable<release>-<architecture>` for product images
+/// and `<release>-<architecture>` for operator images. Branches of other
+/// releases (e.g. `0.0.0-dev` images built from main) never match.
+fn product_version_branch_pattern(releases: &[String]) -> Result<Regex> {
+    let release_pattern = Regex::new(r"^\d+\.\d+\.\d+$")?;
+    for release in releases {
+        if !release_pattern.is_match(release) {
+            bail!("invalid release {release:?}, expected a release like 26.7.0");
+        }
+    }
+    let alternatives = releases
+        .iter()
+        .map(|release| regex::escape(release))
+        .collect::<Vec<_>>()
+        .join("|");
+    Ok(Regex::new(&format!(
+        r"(?:^|-stackable)(?:{alternatives})-(?:amd64|arm64)$"
+    ))?)
+}
+
 /// Applies the Stackable customizations to a CSAF document returned by
 /// SecObserve and writes it to the advisory directory structure, together with
 /// its PGP signature and hashes. The document tracking id determines the
 /// filename (the lowercased tracking id), so it must be stable across republications:
 /// an already published document is updated in place, keeping its initial release
 /// date and revision history.
-fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Result<()> {
+fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Result<PublishOutcome> {
     // Parse CSAF document from response. SecObserve can emit a `cpe` in the
     // product identification helper (often an empty string or a CPE 2.3 formatted
     // string). The `csaf` crate parses `cpe` via the `cpe` crate, which only
@@ -407,10 +616,19 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
     // If an advisory for this vulnerability was already published, update it in
     // place: keep its location (the year directory of the initial release, see
     // CSAF requirement 11), its initial release date and its revision history.
-    let csaf_filename = match find_existing_advisory(&filename)? {
+    let (csaf_filename, outcome) = match find_existing_advisory(&filename)? {
         Some(existing_csaf_filename) => {
             let existing_csaf: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&existing_csaf_filename)?)?;
+
+            // Advisories are republished regularly, so only publish a new
+            // revision if the content actually changed. Otherwise every run
+            // would add a revision and update the advisory in changes.csv,
+            // making consumers download all advisories again.
+            if equal_except_tracking(&existing_csaf, &serde_json::to_value(&csaf)?) {
+                return Ok(PublishOutcome::Unchanged);
+            }
+
             let existing_tracking = existing_csaf
                 .get("document")
                 .and_then(|document| document.get("tracking"))
@@ -436,46 +654,36 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
             csaf.document.tracking.revision_history = revision_history;
             csaf.document.tracking.version = new_version.to_string();
 
-            existing_csaf_filename
+            (existing_csaf_filename, PublishOutcome::Updated)
         }
         None => {
             let current_year = chrono::Local::now().year().to_string();
             fs::create_dir_all(&current_year)?;
-            format!("{}/{}", current_year, filename)
+            (
+                format!("{}/{}", current_year, filename),
+                PublishOutcome::Created,
+            )
         }
     };
     // Create a value using `to_value` first, to sort the keys in the JSON output
     let csaf_as_string = serde_json::to_string_pretty(&serde_json::to_value(&csaf)?)?;
-    fs::write(&csaf_filename, &csaf_as_string)?;
 
-    let validator_result = std::process::Command::new("node")
-        .arg("/csaf_validator/validate.js")
-        .arg(format!(
-            "{}/{}",
-            env::current_dir()?.to_string_lossy(),
-            csaf_filename
-        ))
-        .output()?;
-    if !validator_result.status.success() {
-        eprintln!("CSAF validation failed:");
-        eprintln!("{}", String::from_utf8_lossy(&validator_result.stdout));
-        eprintln!("{}", String::from_utf8_lossy(&validator_result.stderr));
-        println!("CSAF content:\n{}", csaf_as_string);
-        std::process::exit(1);
-    }
-
-    // Generate detached PGP signature
-    let key_string = env::var("PGP_SECRET_KEY").context("Missing PGP secret key!")?;
-    let (secret_key, _headers) = SignedSecretKey::from_string(&key_string)?;
-    let passphrase =
-        env::var("PGP_SECRET_KEY_PASSPHRASE").context("Missing PGP secret key passphrase!")?;
-    let signature = DetachedSignature::sign_binary_data(
-        rand::thread_rng(),
-        &secret_key.primary_key,
-        &Password::from(passphrase),
-        HashAlgorithm::Sha256,
-        csaf_as_string.as_bytes(),
-    )?;
+    // Validate and sign the document before it replaces the published one, so
+    // that an invalid document or one without a matching signature never ends
+    // up in the repository. The validator loads the document with `require`,
+    // which needs the `.json` extension.
+    let pending_csaf_filename = format!("{csaf_filename}.pending.json");
+    fs::write(&pending_csaf_filename, &csaf_as_string)?;
+    let signature = validate_csaf_document(&pending_csaf_filename)
+        .and_then(|()| sign_csaf_document(&csaf_as_string));
+    let signature = match signature {
+        Ok(signature) => signature,
+        Err(error) => {
+            fs::remove_file(&pending_csaf_filename)?;
+            return Err(error);
+        }
+    };
+    fs::rename(&pending_csaf_filename, &csaf_filename)?;
     let mut signature_filehandle = fs::File::create(format!("{}.asc", csaf_filename))?;
     signature.to_armored_writer(&mut signature_filehandle, ArmorOptions::default())?;
 
@@ -517,6 +725,60 @@ fn publish_csaf_document(body: &str, tracking_id: &str, tlp_label: &str) -> Resu
     // Prepend the filename to index.txt, unless it is already listed
     upsert_line("index.txt", &csaf_filename, &csaf_filename)?;
 
+    Ok(outcome)
+}
+
+/// Returns whether the two CSAF documents are equal apart from their tracking
+/// data (release dates, revision history, version and generator), which
+/// changes on every export even if the vulnerability statements do not.
+fn equal_except_tracking(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    fn without_tracking(csaf: &serde_json::Value) -> serde_json::Value {
+        let mut csaf = csaf.clone();
+        if let Some(document) = csaf
+            .get_mut("document")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            document.remove("tracking");
+        }
+        csaf
+    }
+    without_tracking(left) == without_tracking(right)
+}
+
+/// Creates a detached PGP signature of the CSAF document.
+fn sign_csaf_document(csaf_as_string: &str) -> Result<DetachedSignature> {
+    let key_string = env::var("PGP_SECRET_KEY").context("Missing PGP secret key!")?;
+    let (secret_key, _headers) = SignedSecretKey::from_string(&key_string)?;
+    let passphrase =
+        env::var("PGP_SECRET_KEY_PASSPHRASE").context("Missing PGP secret key passphrase!")?;
+    let signature = DetachedSignature::sign_binary_data(
+        rand::thread_rng(),
+        &secret_key.primary_key,
+        &Password::from(passphrase),
+        HashAlgorithm::Sha256,
+        csaf_as_string.as_bytes(),
+    )?;
+    Ok(signature)
+}
+
+/// Validates the CSAF document in the given file (relative to the current
+/// directory) with the CSAF validator.
+fn validate_csaf_document(filename: &str) -> Result<()> {
+    let validator_result = std::process::Command::new("node")
+        .arg("/csaf_validator/validate.js")
+        .arg(format!(
+            "{}/{}",
+            env::current_dir()?.to_string_lossy(),
+            filename
+        ))
+        .output()?;
+    if !validator_result.status.success() {
+        bail!(
+            "CSAF validation failed:\n{}{}",
+            String::from_utf8_lossy(&validator_result.stdout),
+            String::from_utf8_lossy(&validator_result.stderr)
+        );
+    }
     Ok(())
 }
 
@@ -899,8 +1161,9 @@ fn build_href(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_href, normalize_purl, normalize_purls, rebuild_product_tree_branches,
-        remove_conflicting_flags, replace_relationships_with_components, sanitize_filename,
+        build_href, equal_except_tracking, normalize_purl, normalize_purls,
+        product_version_branch_pattern, rebuild_product_tree_branches, remove_conflicting_flags,
+        replace_relationships_with_components, sanitize_filename,
         sanitize_product_identification_helpers, upsert_line,
     };
     use csaf::definitions::{Branch, BranchCategory, BranchesT, FullProductName, ProductIdT};
@@ -1249,5 +1512,66 @@ mod tests {
             build_href("2026", "cve-2026-6100.json", false, None),
             "cve-2026-6100.json"
         );
+    }
+
+    #[test]
+    fn matches_branches_of_the_given_releases() {
+        let pattern = product_version_branch_pattern(&["26.3.0".to_string(), "26.7.0".to_string()])
+            .expect("releases are valid");
+
+        for branch_name in [
+            "2.9.3-stackable26.3.0-amd64",
+            "3.1.6-stackable26.7.0-arm64",
+            "26.3.0-amd64",
+            "26.7.0-arm64",
+        ] {
+            assert!(pattern.is_match(branch_name), "{branch_name} must match");
+        }
+        for branch_name in [
+            "2.9.3-stackable0.0.0-dev-amd64",
+            "0.0.0-dev-amd64",
+            "2.9.3-stackable25.11.0-amd64",
+            "2.9.3-stackable26.3.0",
+            "26.3.0",
+            "2.9.3-stackable126.3.0-amd64",
+            "126.3.0-amd64",
+            "26.3.0-amd64-pr123",
+        ] {
+            assert!(
+                !pattern.is_match(branch_name),
+                "{branch_name} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_releases() {
+        assert!(product_version_branch_pattern(&["26.3".to_string()]).is_err());
+        assert!(product_version_branch_pattern(&[".*".to_string()]).is_err());
+    }
+
+    #[test]
+    fn ignores_tracking_data_when_comparing_documents() {
+        let published = json!({
+            "document": {
+                "title": "Stackable Security Advisory for: airflow:3.1.6-stackable26.3.0-amd64",
+                "tracking": {
+                    "current_release_date": "2026-10-27T08:10:54.639265Z",
+                    "revision_history": [{"date": "2026-10-27T08:10:54.639265Z", "number": "1", "summary": "Initial release"}],
+                    "version": "1"
+                }
+            },
+            "vulnerabilities": [{"cve": "CVE-2026-0001", "product_status": {"known_not_affected": ["a"]}}]
+        });
+        let mut republished = published.clone();
+        republished["document"]["tracking"] = json!({
+            "current_release_date": "2026-11-23T04:00:00Z",
+            "revision_history": [{"date": "2026-11-23T04:00:00Z", "number": "1", "summary": "Initial release"}],
+            "version": "1"
+        });
+        assert!(equal_except_tracking(&published, &republished));
+
+        republished["vulnerabilities"][0]["product_status"] = json!({"known_affected": ["a"]});
+        assert!(!equal_except_tracking(&published, &republished));
     }
 }
