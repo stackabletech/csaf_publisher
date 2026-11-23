@@ -5,7 +5,7 @@ use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecre
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::Password;
 use sha2::{Digest, Sha256, Sha512};
-use std::{collections::HashMap, env, fs};
+use std::{collections::HashMap, env, fs, time::Duration};
 
 use chrono::{Datelike, SecondsFormat};
 use color_eyre::eyre::{bail, ContextCompat, Result};
@@ -408,7 +408,12 @@ fn secobserve_list(
     query: &[(&str, &str)],
     secobserve_api_token: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    let client = reqwest::blocking::Client::new();
+    // List endpoints can be slow, e.g. SecObserve counts the observations of
+    // every branch in the branch list, so allow more than the default timeout
+    // of 30 seconds.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
     let mut results = vec![];
     // Pages are requested by number instead of following the `next` links,
     // because SecObserve builds those from the request it received, so behind
@@ -418,7 +423,7 @@ fn secobserve_list(
         let response = client
             .get(format!("{SECOBSERVE_API_BASE}/{path}"))
             .query(query)
-            .query(&[("page", page.as_str()), ("page_size", "1000")])
+            .query(&[("page", page.as_str()), ("page_size", "100")])
             .header(
                 "Authorization",
                 format!("APIToken {}", secobserve_api_token),
@@ -522,18 +527,28 @@ fn list_product_versions(releases: &[String], secobserve_api_token: &str) -> Res
             })
             .collect();
 
-    let mut product_versions: Vec<String> =
-        secobserve_list("branches/", &[], secobserve_api_token)?
-            .iter()
-            .filter_map(|branch| {
-                let branch_name = branch.get("name")?.as_str()?;
-                if !pattern.is_match(branch_name) {
-                    return None;
-                }
-                let product_name = product_names.get(&branch.get("product")?.as_u64()?)?;
-                Some(format!("{product_name}:{branch_name}"))
-            })
-            .collect();
+    // Listing all branches takes too long, so only list the branches that
+    // contain one of the releases in their name (the `name` filter matches
+    // substrings) and match them exactly afterwards.
+    let mut product_versions = vec![];
+    for release in releases {
+        for branch in secobserve_list("branches/", &[("name", release)], secobserve_api_token)? {
+            let Some(branch_name) = branch.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !pattern.is_match(branch_name) {
+                continue;
+            }
+            let Some(product_name) = branch
+                .get("product")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|product_id| product_names.get(&product_id))
+            else {
+                continue;
+            };
+            product_versions.push(format!("{product_name}:{branch_name}"));
+        }
+    }
     product_versions.sort();
     product_versions.dedup();
     Ok(product_versions)
